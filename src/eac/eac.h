@@ -97,8 +97,12 @@ typedef struct ka_ctx {
         const EVP_MD * md;
         /** @brief Digest's engine */
         ENGINE * md_engine;
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
         /** @brief Context for CMAC */
         CMAC_CTX * cmac_ctx;
+#else
+        EVP_MAC_CTX * cmac_ctx;
+#endif
         /** @brief Cipher to use for encryption/decryption */
         const EVP_CIPHER * cipher;
         /** @brief Cipher's engine */
