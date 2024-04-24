@@ -58,6 +58,10 @@
 #include <openssl/crypto.h>
 #include <openssl/ec.h>
 #include <openssl/ecdh.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+# include <openssl/param_build.h>
+# include <openssl/core_names.h>
+#endif
 
 BUF_MEM *
 dh_gm_generate_key(const PACE_CTX * ctx, BN_CTX *bn_ctx)
@@ -74,16 +78,25 @@ dh_gm_compute_key(PACE_CTX * ctx, const BUF_MEM * s, const BUF_MEM * in,
     int ret = 0;
     BUF_MEM * mem_h = NULL;
     BIGNUM * bn_s = NULL, *bn_h = NULL, *bn_g = NULL, *new_g = NULL;
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     DH *static_key = NULL, *ephemeral_key = NULL;
     const BIGNUM *p, *q, *g;
+#else
+    EVP_PKEY *ephemeral_key = NULL;
+    BIGNUM *p = NULL, *q = NULL, *g = NULL;
+    OSSL_PARAM *old_params = NULL, *param = NULL;
+    EVP_PKEY_CTX *pctx = NULL;
+#endif
 
     check(ctx && ctx->static_key && s && ctx->ka_ctx, "Invalid arguments");
 
     BN_CTX_start(bn_ctx);
 
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     static_key = EVP_PKEY_get1_DH(ctx->static_key);
     if (!static_key)
         goto err;
+#endif
 
     /* Convert nonce to BIGNUM */
     bn_s = BN_bin2bn((unsigned char *) s->data, s->length, bn_s);
@@ -99,11 +112,19 @@ dh_gm_compute_key(PACE_CTX * ctx, const BUF_MEM * s, const BUF_MEM * in,
         goto err;
 
     /* Initialize ephemeral parameters with parameters from the static key */
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     ephemeral_key = DHparams_dup(static_key);
     if (!ephemeral_key)
         goto err;
 
     DH_get0_pqg(static_key, &p, &q, &g);
+#else
+    if (!EVP_PKEY_get_bn_param(ctx->static_key, OSSL_PKEY_PARAM_FFC_P, &p)
+            || !EVP_PKEY_get_bn_param(ctx->static_key, OSSL_PKEY_PARAM_FFC_Q, &q)
+            || !EVP_PKEY_get_bn_param(ctx->static_key, OSSL_PKEY_PARAM_FFC_G, &g)) {
+        goto err;
+    }
+#endif
 
     /* map to new generator */
     bn_g = BN_CTX_get(bn_ctx);
@@ -115,6 +136,7 @@ dh_gm_compute_key(PACE_CTX * ctx, const BUF_MEM * s, const BUF_MEM * in,
         !BN_mod_mul(new_g, bn_g, bn_h, p, bn_ctx))
         goto err;
 
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     if (!DH_set0_pqg(ephemeral_key, BN_dup(p), BN_dup(q), new_g))
         goto err;
     new_g = NULL;
@@ -122,6 +144,27 @@ dh_gm_compute_key(PACE_CTX * ctx, const BUF_MEM * s, const BUF_MEM * in,
     /* Copy ephemeral key to context structure */
     if (!EVP_PKEY_set1_DH(ctx->ka_ctx->key, ephemeral_key))
         goto err;
+#else
+    /* Create new key from adjusted parameters */
+    if (!EVP_PKEY_todata(ctx->ka_ctx->key, EVP_PKEY_KEY_PARAMETERS, &old_params)) {
+        goto err;
+    }
+    if (!(param = OSSL_PARAM_locate(old_params, OSSL_PKEY_PARAM_FFC_P))
+            || !OSSL_PARAM_set_BN(param, p)
+            || !(param = OSSL_PARAM_locate(old_params, OSSL_PKEY_PARAM_FFC_Q))
+            || !OSSL_PARAM_set_BN(param, q)
+            || !(param = OSSL_PARAM_locate(old_params, OSSL_PKEY_PARAM_FFC_G))
+            || !OSSL_PARAM_set_BN(param, new_g)) {
+        goto err;
+    }
+    if (!(pctx = EVP_PKEY_CTX_new_from_name(NULL, "DH", NULL))
+            || EVP_PKEY_fromdata_init(pctx) <= 0
+            || EVP_PKEY_fromdata(pctx, &ephemeral_key, EVP_PKEY_KEYPAIR, old_params) <= 0) {
+        goto err;
+    }
+    EVP_PKEY_free(ctx->ka_ctx->key);
+    ctx->ka_ctx->key = ephemeral_key;
+#endif
 
     ret = 1;
 
@@ -130,18 +173,21 @@ err:
         OPENSSL_cleanse(mem_h->data, mem_h->max);
         BUF_MEM_free(mem_h);
     }
-    if (bn_h)
-        BN_clear_free(bn_h);
-    if (bn_s)
-        BN_clear_free(bn_s);
+    BN_clear_free(bn_h);
+    BN_clear_free(bn_s);
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     /* Decrement reference count, keys are still available via PACE_CTX */
-    if (static_key)
-        DH_free(static_key);
-    if (ephemeral_key)
-        DH_free(ephemeral_key);
+    DH_free(static_key);
+    DH_free(ephemeral_key);
+#else
+    EVP_PKEY_free(ephemeral_key);
+    BN_clear_free(p);
+    BN_clear_free(q);
+    BN_clear_free(g);
+    BN_clear_free(new_g);
+#endif
     BN_CTX_end(bn_ctx);
-    if (new_g)
-        BN_clear_free(new_g);
+    BN_clear_free(new_g);
 
     return ret;
 }
@@ -161,8 +207,15 @@ dh_im_compute_key(PACE_CTX * ctx, const BUF_MEM * s, const BUF_MEM * in,
     int ret = 0;
     BUF_MEM * x_mem = NULL;
     BIGNUM * x_bn = NULL, *a = NULL, *p_1 = NULL, *q = NULL, *g_new = NULL;
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     const BIGNUM *p, *g;
     DH *static_key = NULL, *ephemeral_key = NULL;
+#else
+    EVP_PKEY *ephemeral_key = NULL;
+    BIGNUM *p = NULL, *g = NULL;
+    OSSL_PARAM *old_params = NULL, *param = NULL;
+    EVP_PKEY_CTX *pctx = NULL;
+#endif
 
     check((ctx && in && ctx->ka_ctx), "Invalid arguments");
     if (in->length < (size_t) EVP_CIPHER_key_length(ctx->ka_ctx->cipher)
@@ -171,15 +224,22 @@ dh_im_compute_key(PACE_CTX * ctx, const BUF_MEM * s, const BUF_MEM * in,
 
     BN_CTX_start(bn_ctx);
 
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     static_key = EVP_PKEY_get1_DH(ctx->static_key);
     if (!static_key)
         goto err;
 
     /* Initialize ephemeral parameters with parameters from the static key */
-    ephemeral_key = DHparams_dup_with_q(static_key);
+    ephemeral_key = DHparams_dup_with_q(ctx->static_key);
     if (!ephemeral_key)
         goto err;
     DH_get0_pqg(ephemeral_key, &p, NULL, &g);
+#else
+    if (!EVP_PKEY_get_bn_param(ctx->static_key, OSSL_PKEY_PARAM_FFC_P, &p)
+            || !EVP_PKEY_get_bn_param(ctx->static_key, OSSL_PKEY_PARAM_FFC_G, &g)) {
+        goto err;
+    }
+#endif
 
     /* Perform the actual mapping */
     x_mem = cipher_no_pad(ctx->ka_ctx, NULL, in, s, 1);
@@ -187,7 +247,14 @@ dh_im_compute_key(PACE_CTX * ctx, const BUF_MEM * s, const BUF_MEM * in,
         goto err;
     x_bn = BN_bin2bn((unsigned char *) x_mem->data, x_mem->length, x_bn);
     a = BN_CTX_get(bn_ctx);
+
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     q = DH_get_q(static_key, bn_ctx);
+#else
+    if (!EVP_PKEY_get_bn_param(ctx->static_key, OSSL_PKEY_PARAM_FFC_Q, &q)) {
+        goto err;
+    }
+#endif
     p_1 = BN_dup(p);
     g_new = BN_dup(g);
     if (!x_bn || !a || !q || !p_1 || !g_new ||
@@ -202,6 +269,7 @@ dh_im_compute_key(PACE_CTX * ctx, const BUF_MEM * s, const BUF_MEM * in,
     /* check if g~ != 1 */
     check((!BN_is_one(g_new)), "Bad DH generator");
 
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     DH_set0_pqg(ephemeral_key, BN_dup(p), q, g_new);
     g_new = NULL;
     q = NULL;
@@ -209,25 +277,45 @@ dh_im_compute_key(PACE_CTX * ctx, const BUF_MEM * s, const BUF_MEM * in,
     /* Copy ephemeral key to context structure */
     if (!EVP_PKEY_set1_DH(ctx->ka_ctx->key, ephemeral_key))
         goto err;
+#else
+    /* Create new key from adjusted parameters */
+    if (!EVP_PKEY_todata(ctx->ka_ctx->key, EVP_PKEY_KEY_PARAMETERS, &old_params)) {
+        goto err;
+    }
+    if (!(param = OSSL_PARAM_locate(old_params, OSSL_PKEY_PARAM_FFC_P))
+            || !OSSL_PARAM_set_BN(param, p)
+            || !(param = OSSL_PARAM_locate(old_params, OSSL_PKEY_PARAM_FFC_Q))
+            || !OSSL_PARAM_set_BN(param, q)
+            || !(param = OSSL_PARAM_locate(old_params, OSSL_PKEY_PARAM_FFC_G))
+            || !OSSL_PARAM_set_BN(param, g_new)) {
+        goto err;
+    }
+    if (!(pctx = EVP_PKEY_CTX_new_from_name(NULL, "DH", NULL))
+            || EVP_PKEY_fromdata_init(pctx) <= 0
+            || EVP_PKEY_fromdata(pctx, &ephemeral_key, EVP_PKEY_KEYPAIR, old_params) <= 0) {
+        goto err;
+    }
+    EVP_PKEY_free(ctx->ka_ctx->key);
+    ctx->ka_ctx->key = ephemeral_key;
+#endif
 
     ret = 1;
 
 err:
-    if (q)
-        BN_clear_free(q);
-    if (g_new)
-        BN_clear_free(g_new);
-    if (p_1)
-        BN_clear_free(p_1);
-    if (x_bn)
-        BN_clear_free(x_bn);
-    if (x_mem)
-        BUF_MEM_free(x_mem);
+    BN_clear_free(q);
+    BN_clear_free(g_new);
+    BN_clear_free(p_1);
+    BN_clear_free(x_bn);
+    BUF_MEM_free(x_mem);
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     /* Decrement reference count, keys are still available via PACE_CTX */
-    if (static_key)
-        DH_free(static_key);
-    if (ephemeral_key)
-        DH_free(ephemeral_key);
+    DH_free(static_key);
+    DH_free(ephemeral_key);
+#else
+    EVP_PKEY_free(ephemeral_key);
+    BN_clear_free(p);
+    BN_clear_free(g);
+#endif
     BN_CTX_end(bn_ctx);
 
     return ret;
@@ -265,7 +353,7 @@ ecdh_gm_compute_key(PACE_CTX * ctx, const BUF_MEM * s, const BUF_MEM * in,
     check(static_key, "could not get key object");
 
     /* Extract group parameters */
-    group = EC_GROUP_dup(EC_KEY_get0_group(static_key));
+    group = EVP_PKEY_get_EC_group(ctx->static_key);
     order = BN_CTX_get(bn_ctx);
     cofactor = BN_CTX_get(bn_ctx);
     check(group && cofactor, "internal error");
@@ -333,7 +421,7 @@ err:
     if (ephemeral_key)
         EC_KEY_free(ephemeral_key);
     if (group)
-        EC_GROUP_clear_free(group);
+        EC_GROUP_free(group);
 
     return ret;
 }
@@ -357,8 +445,13 @@ ecdh_im_compute_key(PACE_CTX * ctx, const BUF_MEM * s, const BUF_MEM * in,
     BIGNUM * tmp = NULL, *tmp2 = NULL, *bn_inv = NULL;
     BIGNUM * two = NULL, *three = NULL, *four = NULL, *six = NULL;
     BIGNUM * twentyseven = NULL;
-    EC_KEY *static_key = NULL, *ephemeral_key = NULL;
     EC_POINT *g = NULL;
+    EC_KEY *static_key = NULL, *ephemeral_key = NULL;
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+#else
+    EC_GROUP *group = NULL;
+    OSSL_PARAM *params = NULL;
+#endif
 
     BN_CTX_start(bn_ctx);
 
@@ -391,9 +484,15 @@ ecdh_im_compute_key(PACE_CTX * ctx, const BUF_MEM * s, const BUF_MEM * in,
     if (!x_mem)
         goto err;
 
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     /* Fetch the curve parameters */
     if (!EC_GROUP_get_curve_GFp(EC_KEY_get0_group(static_key), p, a, b, bn_ctx))
         goto err;
+#else
+    group = EVP_PKEY_get_EC_group(ctx->static_key);
+    if (!(EC_GROUP_get_curve(group, p, a, b, bn_ctx)))
+        goto err;
+#endif
 
     /* Assign constants */
     if (    !BN_set_word(two,2)||
@@ -475,18 +574,17 @@ ecdh_im_compute_key(PACE_CTX * ctx, const BUF_MEM * s, const BUF_MEM * in,
     ret = 1;
 
 err:
-    if (x_mem)
-        BUF_MEM_free(x_mem);
-    if (u)
-        BN_free(u);
+    BUF_MEM_free(x_mem);
+    BN_free(u);
     BN_CTX_end(bn_ctx);
-    if (g)
-        EC_POINT_clear_free(g);
+    EC_POINT_clear_free(g);
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     /* Decrement reference count, keys are still available via PACE_CTX */
-    if (static_key)
-        EC_KEY_free(static_key);
-    if (ephemeral_key)
-        EC_KEY_free(ephemeral_key);
+    EC_KEY_free(static_key);
+    EC_KEY_free(ephemeral_key);
+#else
+    EC_GROUP_free(group);
+#endif
 
     return ret;
 }
