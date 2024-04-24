@@ -54,14 +54,19 @@
 #include "eac_util.h"
 #include "misc.h"
 #include "pace_lib.h"
+#include "ssl_compat.h"
 #include <eac/eac.h>
 #include <eac/pace.h>
 #include <eac/ri.h>
 #include <openssl/asn1.h>
 #include <openssl/dh.h>
-#include <openssl/ec.h>
 #include <openssl/objects.h>
 #include <openssl/obj_mac.h>
+#include <openssl/ec.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+# include <openssl/core_names.h>
+# include <openssl/param_build.h>
+#endif
 
 /** PACEInfo structure */
 typedef struct pace_info_st {
@@ -281,19 +286,24 @@ ASN1_SEQUENCE(CARD_INFO_LOCATOR) = {
 } ASN1_SEQUENCE_END(CARD_INFO_LOCATOR)
 
 
-
-static EC_KEY *
-ecpkparameters2eckey(ASN1_TYPE *ec_params)
+static EVP_PKEY *
+ecpkparameters2eckey(EVP_PKEY *key, ASN1_TYPE *ec_params)
 {
     EC_GROUP *group = NULL;
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     EC_KEY *ec = NULL;
+#else
+    EVP_PKEY_CTX *ctx = NULL;
+    OSSL_PARAM *group_params = NULL;
+    EVP_PKEY *new_key = NULL;
+#endif
     int length, fail = 1;
     unsigned char *encoded = NULL;
     const unsigned char *p;
 
-    check(ec_params && ec_params->type == V_ASN1_SEQUENCE,
+    check(ec_params && ec_params->type == V_ASN1_SEQUENCE && key,
             "Invalid arguments");
-
+    
     /* unfortunately we need to re-pack and re-parse the ECPKPARAMETERS,
      * because there is no official API for using it directly (see
      * openssl/crypto/ec/ec.h) */
@@ -302,28 +312,53 @@ ecpkparameters2eckey(ASN1_TYPE *ec_params)
     check(length > 0 && d2i_ECPKParameters(&group, &p, length),
             "Could not decode EC parameters");
 
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     ec = EC_KEY_new();
     check(ec && EC_KEY_set_group(ec, group),
             "Could not initialize key object");
+    EVP_PKEY_set1_EC_KEY(key, ec);
+#else
+    /* keys are immutable, for modification of key, use merge and from data */
+    if (!(group_params = EC_GROUP_to_params(group, NULL, NULL, NULL))) {
+        goto err;
+    }
+    if (!(ctx = EVP_PKEY_CTX_new_from_name(NULL, "EC", NULL))
+            || !EVP_PKEY_fromdata_init(ctx)
+            || !EVP_PKEY_fromdata(ctx, &new_key, EVP_PKEY_KEYPAIR, group_params)) {
+        goto err;
+    }
+    EVP_PKEY_free(key);
+    key = new_key;
+#endif
 
     fail = 0;
 
 err:
-    if (group)
-        EC_GROUP_free(group);
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    EVP_PKEY_CTX_free(ctx);
+    OSSL_PARAM_free(group_params);
+#endif
+    EC_GROUP_free(group);
     OPENSSL_free(encoded);
     if (fail) {
-        if (ec)
-            EC_KEY_free(ec);
-        ec = NULL;
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+        EC_KEY_free(ec);
+#endif
+        key = NULL;
     }
-    return ec;
+    return key;
 }
 
-static DH *
-dhparams2dh(ASN1_TYPE *dh_params)
+static EVP_PKEY *
+dhparams2dh(EVP_PKEY *key, ASN1_TYPE *dh_params)
 {
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     DH *dh = NULL;
+#else
+    EVP_PKEY *decoded_key, *new_key = NULL;
+    EVP_PKEY_CTX *ctx = NULL;
+    OSSL_PARAM *decoded_params = NULL;
+#endif
     int length = 1;
     unsigned char *encoded = NULL;
     const unsigned char *p;
@@ -336,19 +371,39 @@ dhparams2dh(ASN1_TYPE *dh_params)
      * openssl/crypto/dh/dh.h) */
     length = i2d_ASN1_TYPE(dh_params, &encoded);
     p = encoded;
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     check(length > 0 && d2i_DHparams(&dh, &p, length),
             "Could not decode DH parameters");
+    EVP_PKEY_set1_DH_KEY(key, dh);
+#else
+    if (!d2i_KeyParams(EVP_PKEY_DH, &decoded_key, &p, length)) {
+        goto err;
+    }
+    if (!EVP_PKEY_todata(decoded_key, EVP_PKEY_KEYPAIR, &decoded_params)) {
+        goto err;
+    }
+    if (!EVP_PKEY_fromdata_init(ctx)
+            || !EVP_PKEY_fromdata(ctx, &new_key, EVP_PKEY_KEYPAIR, decoded_params)) {
+        goto err;
+    }
+    EVP_PKEY_free(key);
+    key = new_key;
+#endif
 
 err:
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    EVP_PKEY_CTX_free(ctx);
+    OSSL_PARAM_free(decoded_params);
+    EVP_PKEY_free(decoded_key);
+#endif
     OPENSSL_free(encoded);
-    return dh;
+    return key;
 }
 
 static EVP_PKEY *
 aid2pkey(EVP_PKEY **key, ALGORITHM_IDENTIFIER *aid, BN_CTX *bn_ctx)
 {
-    EC_KEY *tmp_ec;
-    DH *tmp_dh;
+    EVP_PKEY *tmp_ec;
     EVP_PKEY *tmp_key = NULL, *ret = NULL;
     char obj_txt[32];
     int nid;
@@ -364,21 +419,14 @@ aid2pkey(EVP_PKEY **key, ALGORITHM_IDENTIFIER *aid, BN_CTX *bn_ctx)
     /* Extract actual parameters */
     nid = OBJ_obj2nid(aid->algorithm);
     if (       nid == NID_dhpublicnumber) {
-        tmp_dh = dhparams2dh(aid->parameters);
-        check(tmp_dh, "Could not decode DH key");
-        EVP_PKEY_set1_DH(tmp_key, tmp_dh);
-        DH_free(tmp_dh);
-
+        tmp_key = dhparams2dh(tmp_key, aid->parameters);
+        check(tmp_key, "Could not decode DH key");
     } else if (nid == NID_X9_62_id_ecPublicKey
             || nid == NID_ecka_dh_SessionKDF_DES3
             || nid == NID_ecka_dh_SessionKDF_AES128
             || nid == NID_ecka_dh_SessionKDF_AES192
             || nid == NID_ecka_dh_SessionKDF_AES256) {
-        tmp_ec = ecpkparameters2eckey(aid->parameters);
-        check(tmp_ec, "Could not decode EC key");
-        EVP_PKEY_set1_EC_KEY(tmp_key, tmp_ec);
-        EC_KEY_free(tmp_ec);
-
+        tmp_key = ecpkparameters2eckey(tmp_key, aid->parameters);
     } else if (nid == NID_standardizedDomainParameters) {
         check(aid->parameters->type == V_ASN1_INTEGER,
                 "Invalid data");
