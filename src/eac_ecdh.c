@@ -53,8 +53,13 @@
 #include <eac/pace.h>
 #include <openssl/ecdh.h>
 #include <openssl/evp.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#include <openssl/param_build.h>
+#endif
+#include <openssl/ec.h>
 #include <openssl/objects.h>
 
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
 int
 init_ecdh(EC_KEY ** ecdh, int standardizedDomainParameters)
 {
@@ -119,38 +124,124 @@ init_ecdh(EC_KEY ** ecdh, int standardizedDomainParameters)
 err:
     return r;
 }
+#else
+int
+init_ecdh(EVP_PKEY ** ecdh, int standardizedDomainParameters)
+{
+    int r = 0;
+    EVP_PKEY * tmp = NULL;
+	EVP_PKEY_CTX *ctx = NULL;
+	OSSL_PARAM *params = NULL;
+	OSSL_PARAM_BLD *bld = NULL;
+    const char *curve = NULL;
+
+    if (!ecdh) {
+        log_err("Invalid arguments");
+        return 0;
+    }
+
+    switch(standardizedDomainParameters) {
+        case 8:
+            /* NOTE: prime192v1 is equivalent to secp192r1 */
+            curve = "prime192v1";
+            break;
+        case 9:
+            curve = "brainpoolP192r1";
+            break;
+        case 10:
+            curve = "secp224r1";
+            break;
+        case 11:
+            curve = "brainpoolP224r1";
+            break;
+        case 12:
+            /* NOTE: prime256v1 is equivalent to secp256r1 */
+            curve = "prime256v1";
+            break;
+        case 13:
+            curve = "brainpoolP256r1";
+            break;
+        case 14:
+            curve = "brainpoolP320r1";
+            break;
+        case 15:
+            curve = "secp384r1";
+            break;
+        case 16:
+            curve = "brainpoolP384r1";
+            break;
+        case 17:
+            curve = "brainpoolP512r1";
+            break;
+        case 18:
+            curve = "secp521r1";
+            break;
+        default:
+            log_err("Invalid arguments");
+            goto err;
+    }
+    if (!tmp)
+        goto err;
+
+    if (!(bld = OSSL_PARAM_BLD_new())
+            || !OSSL_PARAM_BLD_push_utf8_string(bld, "group", curve, strlen(curve))
+            || !(params = OSSL_PARAM_BLD_to_param(bld))) {
+        log_err("Cannot build OpenSSL params");
+        goto err;
+    }
+    if (!(ctx = EVP_PKEY_CTX_new_from_name(0, "EC", 0))
+            || !EVP_PKEY_fromdata_init(ctx)
+            || !EVP_PKEY_fromdata(ctx, &tmp, EVP_PKEY_KEYPAIR, params)) {
+        log_err("Cannot create EC key");
+        goto err;
+    }
+
+    if (*ecdh) {
+        EVP_PKEY_free(*ecdh);
+    }
+    *ecdh = tmp;
+
+    r = 1;
+
+err:
+    OSSL_PARAM_BLD_free(bld);
+    OSSL_PARAM_free(params);
+    EVP_PKEY_CTX_free(ctx);
+    return r;
+}
+#endif
+
 
 BUF_MEM *
 ecdh_generate_key(EVP_PKEY *key, BN_CTX *bn_ctx)
 {
-    EC_KEY *ec = NULL;
     BUF_MEM *ret = NULL;
+    EVP_PKEY_CTX *ctx = NULL;
 
     check(key, "Invalid arguments");
 
-    ec = EVP_PKEY_get1_EC_KEY(key);
-    if (!ec)
-        goto err;
-
-    if (!EC_KEY_generate_key(ec)) {
+    if (!(ctx = EVP_PKEY_CTX_new(key, NULL))
+            || EVP_PKEY_keygen_init(ctx) <= 0
+            || EVP_PKEY_keygen(ctx, &key) <= 0) {
         goto err;
     }
 
     /* The key agreement algorithm ECKA prevents small subgroup attacks by
      * using compatible cofactor multiplication. */
-    ret = EC_POINT_point2mem(ec, bn_ctx, EC_KEY_get0_public_key(ec));
+    ret = EVP_PKEY_pubkey2mem(key, bn_ctx);
 
 err:
-    if (ec)
-        EC_KEY_free(ec);
+    EVP_PKEY_CTX_free(ctx);
     return ret;
 }
 
 BUF_MEM *
 ecdh_compute_key(EVP_PKEY *key, const BUF_MEM * in, BN_CTX *bn_ctx)
 {
-    BUF_MEM * out = NULL;
-    EC_POINT * ecp = NULL;
+    BUF_MEM *out = NULL;
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+
+    EC_POINT *ecp = NULL;
     EC_KEY *ecdh = NULL;
     const EC_GROUP *group = NULL;
 
@@ -188,12 +279,45 @@ ecdh_compute_key(EVP_PKEY *key, const BUF_MEM * in, BN_CTX *bn_ctx)
     return out;
 
 err:
-    if (out)
-        BUF_MEM_free(out);
-    if (ecp)
-        EC_POINT_free(ecp);
-    if (ecdh)
-        EC_KEY_free(ecdh);
+    BUF_MEM_free(out);
+    EC_POINT_free(ecp);
+    EC_KEY_free(ecdh);
 
     return NULL;
+#else
+    EVP_PKEY *peerkey = NULL;
+    EVP_PKEY_CTX *ctx = NULL;
+    size_t len = 0;
+
+    check((key && in), "Invalid arguments");
+
+    if (!(ctx = EVP_PKEY_CTX_new_from_pkey(NULL, key, NULL))
+            || EVP_PKEY_derive_init(ctx) != 1
+            || !(peerkey = EVP_PKEY_dup(key))) {
+        goto err;
+    }
+
+    if (EVP_PKEY_derive_set_peer(ctx, peerkey) != 1
+            || EVP_PKEY_derive(ctx, NULL, &len) != 1) {
+        goto err;
+    }
+
+    /* get buffer in required size */
+    out = BUF_MEM_create(len);
+    if (!out)
+        goto err;
+
+    if (EVP_PKEY_derive(ctx, out->data, &out->length) != 1) {
+        goto err;
+    }
+
+    EVP_PKEY_CTX_free(ctx);
+    EVP_PKEY_free(peerkey);
+    return out;
+err:
+    EVP_PKEY_CTX_free(ctx);
+    EVP_PKEY_free(peerkey);
+    BUF_MEM_free(out);
+    return NULL;
+#endif
 }

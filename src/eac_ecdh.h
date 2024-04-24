@@ -50,11 +50,13 @@
 #include <openssl/buffer.h>
 #include <openssl/ec.h>
 #include <openssl/evp.h>
+
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
 /**
  * @brief initializes a key for ECDH. If the object is already initialised,
  * nothing is don
  *
- * @param[in/out] ecdh elliptic curve object to use
+ * @param[in/out] ECDH elliptic curve object to use
  * @param[in] standardizedDomainParameters specifies which parameters to use
  * (see TR-03110, p. 52)
  *
@@ -62,6 +64,21 @@
  */
 int
 init_ecdh(EC_KEY ** ecdh, int standardizedDomainParameters);
+#else
+/**
+ * @brief initializes a key for ECDH. If the object is already initialised,
+ * nothing is don
+ *
+ * @param[in/out] EVP_PKEY structure storing ECDH elliptic curve object to use
+ * @param[in] standardizedDomainParameters specifies which parameters to use
+ * (see TR-03110, p. 52)
+ *
+ * @return 1 on success or 0 if an error occurred
+ */
+int
+init_ecdh(EVP_PKEY ** ecdh, int standardizedDomainParameters);
+#endif
+
 /**
  * @brief Generates an ECDH keypair
  *
