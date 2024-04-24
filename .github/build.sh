@@ -48,6 +48,7 @@ case "$1" in
         ;;
 esac
 
+openssl version
 autoreconf -vis
 
 case "$1" in
