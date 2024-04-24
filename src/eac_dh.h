@@ -48,8 +48,13 @@
 
 #include <openssl/bn.h>
 #include <openssl/buffer.h>
-#include <openssl/dh.h>
 
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+#include <openssl/dh.h>
+#endif
+
+
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
 /**
  * @brief initializes a DH key structure. If the structure is already initialized,
  * nothing is done
@@ -62,6 +67,22 @@
  */
 int
 init_dh(DH ** dh, int standardizedDomainParameters);
+#else
+/**
+ * @brief initializes a EVP_PKEY structure for DH key. If the structure is already initialized,
+ * nothing is done
+ *
+ * @param[in/out] dh EV_PKEY object to use
+ * @param[in] standardizedDomainParameters specifies which parameters to use
+ * (see TR-03110, p. 52)
+ *
+ * @return 1 on success or 0 if an error occurred
+ */
+int
+init_dh(EVP_PKEY ** dh, int standardizedDomainParameters);
+#endif
+
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
 /**
  * @brief Computes the prime on which the modulus is based.
  *
@@ -75,6 +96,23 @@ init_dh(DH ** dh, int standardizedDomainParameters);
  */
 BIGNUM *
 DH_get_q(const DH *dh, BN_CTX *ctx);
+#else
+/**
+ * @brief Computes the prime on which the modulus is based.
+ *
+ * If DH->q does not exist, tries to guess a Sophie Germain prime matching the
+ * DH's modulus.
+ *
+ * @param[in] dh EVP_PKEY object to use
+ * @param[in] ctx BN_CTX object
+ *
+ * @return q or NULL if an error occurred
+ */
+BIGNUM *
+DH_get_q(const EVP_PKEY *dh, BN_CTX *ctx);
+#endif
+
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
 /**
  * @brief Computes the order of the DH's generator.
  *
@@ -88,6 +126,22 @@ DH_get_q(const DH *dh, BN_CTX *ctx);
  */
 BIGNUM *
 DH_get_order(const DH *dh, BN_CTX *ctx);
+#else
+/**
+ * @brief Computes the order of the DH's generator.
+ *
+ * @param[in] dh EVP_PKEY object to use
+ * @param[in] ctx BN_CTX object (optional)
+ *
+ * @return order of g or NULL if an error occurred
+ *
+ * @note This calculation is for DHs using a safe prime, which will generate
+ * either an order-q or an order-2q group (see crypto/dh/dh_gen.c:151).
+ */
+BIGNUM *
+DH_get_order(const EVP_PKEY *dh, BN_CTX *ctx);
+#endif
+
 /**
  * @brief Generates a DH key pair
  *
@@ -96,6 +150,7 @@ DH_get_order(const DH *dh, BN_CTX *ctx);
  *
  * @return public key of the generated key pair or NULL if an error occurred
  */
+
 BUF_MEM *
 dh_generate_key(EVP_PKEY *key, BN_CTX *bn_ctx);
 /**
@@ -103,9 +158,11 @@ dh_generate_key(EVP_PKEY *key, BN_CTX *bn_ctx);
  *
  * @see PACE_STEP3B_dh_compute_key()
  */
+
 BUF_MEM *
 dh_compute_key(EVP_PKEY *key, const BUF_MEM * in, BN_CTX *bn_ctx);
 
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
 /**
  * @brief Duplicate Diffie-Hellman-Parameters including parameter q.
  *
@@ -118,5 +175,19 @@ dh_compute_key(EVP_PKEY *key, const BUF_MEM * in, BN_CTX *bn_ctx);
  */
 DH *
 DHparams_dup_with_q(DH *dh);
+#else
+/**
+ * @brief Duplicate Diffie-Hellman-Parameters including parameter q.
+ *
+ * DHparams_dup creates a duplicated object copying only p, g and optionally
+ * the length. This object is used to also copy the parameter q.
+ *
+ * @param dh Diffie-Hellman-Parameters
+ *
+ * @return Duplicate object or NULL in case of an error
+ */
+EVP_PKEY *
+DHparams_dup_with_q(EVP_PKEY *dh);
+#endif
 
 #endif /*PACE_DH_H_*/
