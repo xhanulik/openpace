@@ -100,6 +100,8 @@ randb(int numbytes);
  */
 BUF_MEM *
 retail_mac_des(const BUF_MEM * key, const BUF_MEM * in);
+
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
 /**
  * @brief Compute a CMAC of the input buffer using the encryption algorithm
  *           specified in the PACE context structure
@@ -116,6 +118,24 @@ retail_mac_des(const BUF_MEM * key, const BUF_MEM * in);
 BUF_MEM *
 cmac(CMAC_CTX *ctx, const EVP_CIPHER *type, const BUF_MEM * key,
         const BUF_MEM * in, size_t maclen);
+#else
+/**
+ * @brief Compute a CMAC of the input buffer using the encryption algorithm
+ *           specified in the PACE context structure
+ *
+ * @param[in] ctx EVP_CIPHER_CTX object (optional)
+ * @param[in] type contains the encryption algorithm to use
+ * @param[in] key the symmetric key used for the computation. The key must have
+ *           the correct length for the encryption algorithm used
+ * @param[in] in buffer that contains the data to for CMAC computation
+ * @param[in] maclen length in number of bytes of the MAC
+ *
+ * @return buffer containing the CMAC or NULL in case of error
+ */
+BUF_MEM *
+cmac(EVP_MAC_CTX *ctx, const EVP_CIPHER *type, const BUF_MEM * key,
+        const BUF_MEM * in, size_t maclen);
+#endif
 /** @} ***********************************************************************/
 
 /**

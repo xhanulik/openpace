@@ -63,6 +63,10 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/rsa.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+# include <openssl/param_build.h>
+# include <openssl/core_names.h>
+#endif
 
 /**
  * @brief Wrapper to the OpenSSL encryption functions.
@@ -244,11 +248,23 @@ err:
     return out;
 }
 
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
 BUF_MEM *
 cmac(CMAC_CTX *ctx, const EVP_CIPHER *type, const BUF_MEM * key,
         const BUF_MEM * in, size_t maclen)
+#else
+BUF_MEM *
+cmac(EVP_MAC_CTX *ctx, const EVP_CIPHER *type, const BUF_MEM * key,
+        const BUF_MEM * in, size_t maclen)
+#endif
 {
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     CMAC_CTX * cmac_ctx = NULL;
+#else
+    EVP_MAC_CTX *cmac_ctx = NULL;
+    OSSL_PARAM params[2];
+    char *cipher_name = NULL;
+#endif
     BUF_MEM * out = NULL, * tmp = NULL;
     size_t cmac_len = 0;
 
@@ -260,17 +276,32 @@ cmac(CMAC_CTX *ctx, const EVP_CIPHER *type, const BUF_MEM * key,
     if (ctx)
         cmac_ctx = ctx;
     else {
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
         cmac_ctx = CMAC_CTX_new();
+#else
+        cmac_ctx = EVP_MAC_CTX_new(EVP_MAC_fetch(NULL, "CMAC", NULL));
+#endif
     }
 
     /* Initialize the CMAC context, feed in the data, and get the required
      * output buffer size */
-    if (!cmac_ctx ||
-            !CMAC_Init(cmac_ctx, key->data, EVP_CIPHER_key_length(type),
-                type, NULL) ||
-            !CMAC_Update(cmac_ctx, in->data, in->length) ||
-            !CMAC_Final(cmac_ctx, NULL, &cmac_len))
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    if (!cmac_ctx
+            || !CMAC_Init(cmac_ctx, key->data, EVP_CIPHER_key_length(type),
+                type, NULL)
+            || !CMAC_Update(cmac_ctx, in->data, in->length)
+            || !CMAC_Final(cmac_ctx, NULL, &cmac_len))
         goto err;
+#else
+    cipher_name = strdup(EVP_CIPHER_get0_name(type));
+    params[0] = OSSL_PARAM_construct_utf8_string("cipher", cipher_name, 0);
+    params[1] = OSSL_PARAM_construct_end();
+    if (!cmac_ctx
+            || !EVP_MAC_init(cmac_ctx, key->data, EVP_CIPHER_key_length(type), params)
+            || !EVP_MAC_update(cmac_ctx, in->data, in->length)
+            || !EVP_MAC_final(cmac_ctx, NULL, &cmac_len, 0))
+        goto err;
+#endif
 
     /* get buffer in required size */
     out = BUF_MEM_create(cmac_len);
@@ -278,8 +309,13 @@ cmac(CMAC_CTX *ctx, const EVP_CIPHER *type, const BUF_MEM * key,
         goto err;
 
     /* get the actual CMAC */
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     if (!CMAC_Final(cmac_ctx, (unsigned char*) out->data, &out->length))
         goto err;
+#else
+    if (!EVP_MAC_final(cmac_ctx, out->data, &out->length, out->length))
+        goto err;
+#endif
 
     /* Truncate the CMAC if necessary */
     if (cmac_len > maclen) {
@@ -289,13 +325,22 @@ cmac(CMAC_CTX *ctx, const EVP_CIPHER *type, const BUF_MEM * key,
     }
 
     if (!ctx)
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
         CMAC_CTX_free(cmac_ctx);
+#else
+        EVP_MAC_CTX_free(cmac_ctx);
+#endif
 
     return out;
 
 err:
     if (cmac_ctx && !ctx) {
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
         CMAC_CTX_free(cmac_ctx);
+#else
+        EVP_MAC_CTX_free(cmac_ctx);
+        free(cipher_name);
+#endif
     }
     if (out) {
         BUF_MEM_free(out);
@@ -723,9 +768,8 @@ BUF_MEM *
 Comp(EVP_PKEY *key, const BUF_MEM *pub, BN_CTX *bn_ctx, EVP_MD_CTX *md_ctx)
 {
     BUF_MEM *out = NULL;
-    const EC_GROUP *group;
+    EC_GROUP *group = NULL;
     EC_POINT *ecp = NULL;
-    EC_KEY *ec = NULL;
     BIGNUM *x = NULL, *y = NULL;
 
     check((key && pub), "Invalid arguments");
@@ -738,11 +782,7 @@ Comp(EVP_PKEY *key, const BUF_MEM *pub, BN_CTX *bn_ctx, EVP_MD_CTX *md_ctx)
             break;
 
         case EVP_PKEY_EC:
-            ec = EVP_PKEY_get1_EC_KEY(key);
-            if (!ec)
-                goto err;
-
-            group = EC_KEY_get0_group(ec);
+            group = EVP_PKEY_get_EC_group(key);
             ecp = EC_POINT_new(group);
             x = BN_CTX_get(bn_ctx);
             y = BN_CTX_get(bn_ctx);
@@ -764,20 +804,14 @@ Comp(EVP_PKEY *key, const BUF_MEM *pub, BN_CTX *bn_ctx, EVP_MD_CTX *md_ctx)
     }
 
 err:
-    if (ecp)
-        EC_POINT_free(ecp);
-    /* Decrease the reference count, the key is still available in the EVP_PKEY
-     * structure */
-    if (ec)
-        EC_KEY_free(ec);
+    EC_POINT_free(ecp);
+    EC_GROUP_free(group);
     BN_CTX_end(bn_ctx);
 
     return out;
 }
 
 int EVP_PKEY_set_std_dp(EVP_PKEY *key, int stnd_dp) {
-
-    DH *dh = NULL;
     EC_KEY *ec = NULL;
 
     if (!key) {
@@ -790,11 +824,17 @@ int EVP_PKEY_set_std_dp(EVP_PKEY *key, int stnd_dp) {
         case 0:
         case 1:
         case 2:
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+            DH *dh = NULL;
             if (!init_dh(&dh, stnd_dp))
                 return 0;
             EVP_PKEY_set1_DH(key, dh);
             /* Decrement reference count */
             DH_free(dh);
+#else
+            if (!init_dh(&key, stnd_dp))
+                return 0;
+#endif
             break;
 
         case 8:
@@ -808,11 +848,17 @@ int EVP_PKEY_set_std_dp(EVP_PKEY *key, int stnd_dp) {
         case 16:
         case 17:
         case 18:
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+            EC_KEY *ec = NULL;
             if (!init_ecdh(&ec, stnd_dp))
                 return 0;
             EVP_PKEY_set1_EC_KEY(key, ec);
             /* Decrement reference count */
             EC_KEY_free(ec);
+#else
+            if (!init_ecdh(&key, stnd_dp))
+                return 0;
+#endif
             break;
 
         default:
@@ -843,16 +889,24 @@ EVP_PKEY_set_keys(EVP_PKEY *evp_pkey,
     EC_POINT *ec_point = NULL;
     BIGNUM *bn = NULL, *dh_pub_key, *dh_priv_key;
     int ok = 0;
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     const EC_GROUP *group;
+#else
+    OSSL_PARAM_BLD *param_bld = NULL;
+    OSSL_PARAM *params = NULL, *old_params = NULL, *new_params = NULL;
+    EVP_PKEY *new_key = NULL;
+    EVP_PKEY_CTX *ctx = NULL;
+#endif
 
     check(evp_pkey, "Invalid arguments");
 
     switch (EVP_PKEY_base_id(evp_pkey)) {
         case EVP_PKEY_EC:
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
             ec_key = EVP_PKEY_get1_EC_KEY(evp_pkey);
             if (!ec_key)
                 goto err;
-            group = EC_KEY_get0_group(ec_key);
+            group = EVP_PKEY_get_EC_group(evp_pkey);
 
             if (pubkey) {
                 ec_point = EC_POINT_new(group);
@@ -870,10 +924,38 @@ EVP_PKEY_set_keys(EVP_PKEY *evp_pkey,
 
             if (!EVP_PKEY_set1_EC_KEY(evp_pkey, ec_key))
                 goto err;
+#else
+
+            if (!(param_bld = OSSL_PARAM_BLD_new())
+                    || !(params = OSSL_PARAM_BLD_to_param(param_bld))) {
+                goto err;
+            }
+            if (pubkey) {
+                if (!OSSL_PARAM_BLD_push_octet_string(param_bld, OSSL_PKEY_PARAM_PUB_KEY,
+                        pubkey, pubkey_len))
+                    goto err;
+            }
+            if (privkey) {
+                bn = BN_bin2bn(privkey, privkey_len, bn);
+                if (!bn || !OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_PRIV_KEY, bn))
+                    goto err;
+            }
+            if (!(params = OSSL_PARAM_BLD_to_param(param_bld))
+                    || !EVP_PKEY_todata(evp_pkey, EVP_PKEY_KEY_PARAMETERS, &old_params)
+                    || !(new_params = OSSL_PARAM_merge(old_params, params))) {
+                goto err;
+            }
+            if (!(ctx = EVP_PKEY_CTX_new_from_name(NULL, "EC", NULL))
+                || EVP_PKEY_fromdata_init(ctx) <= 0
+                || EVP_PKEY_fromdata(ctx, &new_key, EVP_PKEY_KEYPAIR, new_params) <= 0) {
+                goto err;
+            }
+#endif
             break;
 
         case EVP_PKEY_DH:
         case EVP_PKEY_DHX:
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
             dh = EVP_PKEY_get1_DH(evp_pkey);
             if (!dh)
                 goto err;
@@ -891,6 +973,33 @@ EVP_PKEY_set_keys(EVP_PKEY *evp_pkey,
 
             if (!EVP_PKEY_set1_DH(evp_pkey, dh))
                 goto err;
+#else
+
+            if (!(param_bld = OSSL_PARAM_BLD_new())
+                    || !(params = OSSL_PARAM_BLD_to_param(param_bld))) {
+                goto err;
+            }
+            if (pubkey) {
+                dh_pub_key = BN_bin2bn(pubkey, pubkey_len, NULL);
+                if (!dh_pub_key || !OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_PUB_KEY, dh_pub_key))
+                    goto err;
+            }
+            if (privkey) {
+                dh_priv_key = BN_bin2bn(privkey, privkey_len, NULL);
+                if (!dh_priv_key || !OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_PRIV_KEY, dh_priv_key))
+                    goto err;
+            }
+            if (!(params = OSSL_PARAM_BLD_to_param(param_bld))
+                    || !EVP_PKEY_todata(evp_pkey, EVP_PKEY_KEY_PARAMETERS, &old_params)
+                    || !(new_params = OSSL_PARAM_merge(old_params, params))) {
+                goto err;
+            }
+            if (!(ctx = EVP_PKEY_CTX_new_from_name(NULL, "DH", NULL))
+                || EVP_PKEY_fromdata_init(ctx) <= 0
+                || EVP_PKEY_fromdata(ctx, &new_key, EVP_PKEY_KEYPAIR, new_params) <= 0) {
+                goto err;
+            }
+#endif
             break;
 
         default:
@@ -902,14 +1011,20 @@ EVP_PKEY_set_keys(EVP_PKEY *evp_pkey,
     ok = 1;
 
 err:
-    if (bn)
-        BN_clear_free(bn);
-    if (ec_key)
-        EC_KEY_free(ec_key);
-    if (dh)
-        DH_free(dh);
-    if (ec_point)
-        EC_POINT_clear_free(ec_point);
+    BN_clear_free(bn);
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    EC_GROUP_free(group);
+    EC_KEY_free(ec_key);
+    DH_free(dh);
+    EC_POINT_clear_free(ec_point);
+#else
+    OSSL_PARAM_BLD_free(param_bld);
+    OSSL_PARAM_free(params);
+    OSSL_PARAM_free(new_params);
+    OSSL_PARAM_free(old_params);
+    BN_clear_free(dh_pub_key);
+    BN_clear_free(dh_priv_key);
+#endif
 
     return ok;
 }
@@ -917,43 +1032,66 @@ err:
 BUF_MEM *
 get_pubkey(EVP_PKEY *key, BN_CTX *bn_ctx)
 {
-    BUF_MEM *out;
+    BUF_MEM *out = NULL;
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     DH *dh;
     EC_KEY *ec;
     const EC_POINT *ec_pub;
     const BIGNUM *dh_pub_key;
+#else
+    BIGNUM *dh_pub_key = NULL;
+    char *ec_pub_key = NULL;
+    size_t ec_pub_len = 0;
+#endif
 
     check_return(key, "invalid arguments");
 
     switch (EVP_PKEY_base_id(key)) {
         case EVP_PKEY_DH:
         case EVP_PKEY_DHX:
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
             dh = EVP_PKEY_get1_DH(key);
             check_return(dh, "no DH key");
 
             DH_get0_key(dh, &dh_pub_key, NULL);
             out = BN_bn2buf(dh_pub_key);
-
             DH_free(dh);
+#else
+            if (!EVP_PKEY_get_bn_param(key, OSSL_PKEY_PARAM_PUB_KEY, &dh_pub_key))
+                goto err;
+            out = BN_bn2buf(dh_pub_key);
+            BN_clear_free(dh_pub_key);
+#endif
+            
             break;
 
         case EVP_PKEY_EC:
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
             ec = EVP_PKEY_get1_EC_KEY(key);
             check_return(ec, "no EC key");
 
             ec_pub = EC_KEY_get0_public_key(ec);
             check_return(ec_pub, "no EC public key");
-
             out = EC_POINT_point2mem(ec, bn_ctx, ec_pub);
-
             EC_KEY_free(ec);
+#else
+            if (!EVP_PKEY_get_octet_string_param(key, OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY, NULL, 0, &ec_pub_len)
+                    || !(ec_pub_key = malloc(ec_pub_len))
+                    || !EVP_PKEY_get_octet_string_param(key, OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY, ec_pub_key, ec_pub_len, NULL)) {
+                free(ec_pub_key);
+                goto err;
+            }
+            out = BUF_MEM_create(ec_pub_len);
+            memcpy(out->data, ec_pub_key, ec_pub_len);
+            free(ec_pub_key);
+#endif
             break;
 
         default:
             log_err("unknown type of key");
             return NULL;
     }
-
+err:
     return out;
 }
 
