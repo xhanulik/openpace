@@ -93,6 +93,7 @@ BUF_MEM_dup(const BUF_MEM * in);
 BUF_MEM *
 BN_bn2buf(const BIGNUM *bn);
 
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
 /**
  * @brief converts an EC_POINT object to a BUF_MEM object
  *
@@ -104,6 +105,30 @@ BN_bn2buf(const BIGNUM *bn);
  */
 BUF_MEM *
 EC_POINT_point2mem(const EC_KEY * ecdh, BN_CTX * bn_ctx, const EC_POINT * ecp);
+#else
+/**
+ * @brief converts an EC_POINT object to a BUF_MEM object
+ *
+ * @param ecdh EVP_PKEY object
+ * @param bn_ctx object (optional)
+ * @param ecp elliptic curve point to convert
+ *
+ * @return converted elliptic curve point or NULL if an error occurred
+ */
+BUF_MEM *
+EC_POINT_point2mem(const EVP_PKEY * ecdh, BN_CTX * bn_ctx, const EC_POINT * ecp);
+#endif
+
+/**
+ * @brief converts an EC_POINT object to a BUF_MEM object
+ *
+ * @param ecdh EVP_PKEY object
+ * @param bn_ctx object (optional)
+ *
+ * @return converted elliptic curve point or NULL if an error occurred
+ */
+BUF_MEM *
+EVP_PKEY_pubkey2mem(const EVP_PKEY * key, BN_CTX * bn_ctx);
 
 #ifdef HAVE_EC_KEY_METHOD
 const EC_KEY_METHOD *EC_KEY_OpenSSL_Point(void);
@@ -115,4 +140,14 @@ void
 EAC_add_all_objects(void);
 void
 EAC_remove_all_objects(void);
+
+/**
+ * @brief Get EC group from EVP_PKEY structure
+ *
+ * @param key EVP_PKEY object
+ *
+ * @return EC_GROUP structure or NULL if error occured
+ */
+EC_GROUP *
+EVP_PKEY_get_EC_group(const EVP_PKEY *key);
 #endif

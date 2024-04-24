@@ -53,6 +53,10 @@
 #include <openssl/ecdh.h>
 #include <openssl/ecdsa.h>
 #include <openssl/ossl_typ.h>
+#include <openssl/evp.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+# include <openssl/core_names.h>
+#endif
 #include <stdint.h>
 #include <string.h>
 
@@ -151,6 +155,7 @@ int new_ecdh_compute_key_point(unsigned char **psec, size_t *pseclen, const
     *psec = OPENSSL_malloc(133);
     check(*psec, "Out of memory");
     *pseclen = 133;
+    
     ret = ecdh_compute_key_point(*psec, *pseclen, pub_key, (EC_KEY *) ecdh, NULL);
 err:
     if (ret <= 0) {
@@ -293,6 +298,7 @@ BN_bn2buf(const BIGNUM *bn)
     return out;
 }
 
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
 BUF_MEM *
 EC_POINT_point2mem(const EC_KEY * ecdh, BN_CTX * bn_ctx, const EC_POINT * ecp)
 {
@@ -316,4 +322,127 @@ EC_POINT_point2mem(const EC_KEY * ecdh, BN_CTX * bn_ctx, const EC_POINT * ecp)
             bn_ctx);
 
     return out;
+}
+#else
+BUF_MEM *
+EC_POINT_point2mem(const EVP_PKEY * ecdh, BN_CTX * bn_ctx, const EC_POINT * ecp)
+{
+    size_t len;
+    BUF_MEM * out;
+    char point_conversion_format[12] = {0};
+    int compression_form = POINT_CONVERSION_UNCOMPRESSED;
+    char group_name[256] = {0};
+    int nid;
+    EC_GROUP *group = NULL;
+
+    if (!ecp)
+        return NULL;
+
+    /* get pubkey conversion format */
+    if (!EVP_PKEY_get_utf8_string_param(ecdh, OSSL_PKEY_PARAM_EC_POINT_CONVERSION_FORMAT,
+                point_conversion_format, sizeof(point_conversion_format), NULL)) {
+        return NULL;
+    }
+    if (strcmp(point_conversion_format, "compressed") == 0) 
+        compression_form = POINT_CONVERSION_COMPRESSED;
+
+    /* get group */
+    if (!(group = EVP_PKEY_get_EC_group(ecdh))) {
+        return NULL;
+    }
+
+    len = EC_POINT_point2oct(group, ecp, compression_form, NULL, 0, bn_ctx);
+    if (len == 0) {
+        EC_GROUP_free(group);
+        return NULL;
+    }
+
+    out = BUF_MEM_create(len);
+    if (!out) {
+        EC_GROUP_free(group);
+        return NULL;
+    }
+
+    out->length = EC_POINT_point2oct(group, ecp, compression_form,
+            (unsigned char *) out->data, out->max, bn_ctx);
+
+    return out;
+}
+#endif
+
+BUF_MEM *
+EVP_PKEY_pubkey2mem(const EVP_PKEY * key, BN_CTX * bn_ctx) {
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    EC_KEY *ec = NULL;
+    if (!(ec = EVP_PKEY_get1_EC_KEY(key)))
+        return NULL;
+    return EC_POINT_point2mem(ec, bn_ctx, EC_KEY_get0_public_key(ec));
+#else
+    BUF_MEM *ret = NULL;
+    unsigned char *pubkey = NULL;
+    size_t publen = 0;
+    int nid = 0;
+    char group_name[256];
+    EC_POINT *point = NULL;
+    EC_GROUP *group = NULL;
+
+    /* get length of key */
+    EVP_PKEY_get_octet_string_param(key, OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY,
+            NULL, 0, &publen);
+    if (!(pubkey = malloc(publen))) {
+        return NULL;
+    }
+    /* extract public key and group name */
+    if (!EVP_PKEY_get_octet_string_param(key, OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY, ret->data, publen, NULL)
+            || !EVP_PKEY_get_group_name(key, group_name, sizeof(group_name), NULL)) {
+        free(pubkey);
+        return NULL;
+    }
+    /* convert pubkey into point representation*/
+    if ((nid = OBJ_sn2nid(group_name) == 0) ||
+            !(group = EC_GROUP_new_by_curve_name(nid)) ||
+            !(point = EC_POINT_new(group)) ||
+            EC_POINT_oct2point(group, point, pubkey, publen, NULL) != 1) {
+        free(pubkey);
+        EC_POINT_free(point);
+        EC_GROUP_free(group);
+        return NULL;
+    }
+    
+    return EC_POINT_point2mem(key, bn_ctx, point);
+#endif
+}
+
+EC_GROUP *
+EVP_PKEY_get_EC_group(const EVP_PKEY *key)
+{
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    EC_KEY *ec = NULL;
+    const EC_GROUP *ec_group = NULL;
+#else
+    OSSL_PARAM *params = NULL;
+#endif
+    EC_GROUP *group = NULL;
+
+    if (!EVP_PKEY_is_a(key, "EC"))
+        goto err;
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    ec = EVP_PKEY_get1_EC_KEY(key);
+    if (!ec)
+        goto err;
+    ec_group = EC_KEY_get0_group(ec);
+    group = EC_GROUP_dup(ec_group);
+#else
+    if (!EVP_PKEY_todata(key, EVP_PKEY_KEY_PARAMETERS, &params))
+        goto err;
+    group = EC_GROUP_new_from_params(params, NULL, NULL);
+#endif
+
+err:
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    EC_KEY_free(ec);
+#else
+    OSSL_PARAM_free(params);
+#endif
+    return group;
 }
