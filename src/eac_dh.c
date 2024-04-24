@@ -414,6 +414,7 @@ dh_generate_key(EVP_PKEY *key, BN_CTX *bn_ctx)
     BUF_MEM *ret = NULL;
 #if OPENSSL_VERSION_NUMBER < 0x30000000L
     const BIGNUM *pub_key;
+    DH *dh = NULL;
 #else
     BIGNUM *pub_key;
 #endif
@@ -434,6 +435,8 @@ dh_generate_key(EVP_PKEY *key, BN_CTX *bn_ctx)
         goto err;
 
 #if OPENSSL_VERSION_NUMBER < 0x30000000L
+    dh = EVP_PKEY_get1_DH(key);
+    check(dh, "Invalid DH key");
     DH_get0_key(dh, &pub_key, NULL);
 #else
     EVP_PKEY_get_bn_param(key, OSSL_PKEY_PARAM_PUB_KEY, &pub_key);
