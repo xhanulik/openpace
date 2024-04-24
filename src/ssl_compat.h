@@ -64,3 +64,7 @@ int EC_POINT_set_affine_coordinates(const EC_GROUP *group, EC_POINT *p, const BI
 EVP_PKEY *
 EVP_PKEY_dup(EVP_PKEY *key);
 #endif
+
+#ifndef EC_GROUP_to_params
+OSSL_PARAM *EC_GROUP_to_params(const EC_GROUP *group, OSSL_LIB_CTX *libctx, const char *propq, BN_CTX *bnctx);
+#endif

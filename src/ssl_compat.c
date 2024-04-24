@@ -10,6 +10,10 @@
 #include <openssl/evp.h>
 #include <openssl/rsa.h>
 #include <string.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+# include <openssl/param_build.h>
+# include <openssl/core_names.h>
+#endif
 
 #ifndef HAVE_DH_SET0_KEY
 int DH_set0_key(DH *dh, BIGNUM *pub_key, BIGNUM *priv_key)
@@ -260,5 +264,145 @@ err:
         EVP_PKEY_free(out);
 
     return NULL;
+}
+#endif
+
+#ifndef HAVE_EC_GROUP_to_params
+OSSL_PARAM *EC_GROUP_to_params(const EC_GROUP *group, OSSL_LIB_CTX *libctx,
+                               const char *propq, BN_CTX *bnctx)
+{
+    OSSL_PARAM_BLD *bld = NULL;
+    BN_CTX *new_bnctx = NULL;
+    OSSL_PARAM *params = NULL;
+    int conv_form = 0, encoding_flag = 0, curve_nid = NID_undef;
+    const char *conv_form_name = NULL, *encoding_name = NULL;
+    unsigned char *gen_buf = NULL;
+    BIGNUM *p = NULL, *a = NULL, *b = NULL;
+
+    if (group == NULL)
+        goto err;
+
+    bld = OSSL_PARAM_BLD_new();
+    if (bld == NULL)
+        goto err;
+
+    if (bnctx == NULL)
+        bnctx = new_bnctx = BN_CTX_new_ex(libctx);
+    if (bnctx == NULL)
+        goto err;
+    BN_CTX_start(bnctx);
+
+    /* get conversion format */
+    conv_form = EC_GROUP_get_point_conversion_form(group);
+    switch(conv_form) {
+        case POINT_CONVERSION_UNCOMPRESSED:
+            conv_form_name = "uncompressed";
+            break;
+        case POINT_CONVERSION_COMPRESSED:
+            conv_form_name = "compressed";
+            break;
+        case POINT_CONVERSION_HYBRID:
+            conv_form_name = "hybrid";
+            break;
+        default:
+            goto err;
+    }
+    if (!OSSL_PARAM_BLD_push_utf8_string(bld, OSSL_PKEY_PARAM_EC_POINT_CONVERSION_FORMAT,
+                conv_form_name, sizeof(conv_form_name))) {
+        goto err;
+    }
+
+    /* get encoding of curve */
+    encoding_flag = EC_GROUP_get_asn1_flag(group) & OPENSSL_EC_NAMED_CURVE;
+    encoding_name = encoding_flag == OPENSSL_EC_EXPLICIT_CURVE ? "explicit" : "named_curve";
+    if (!OSSL_PARAM_BLD_push_utf8_string(bld, OSSL_PKEY_PARAM_EC_ENCODING, encoding_name,
+                sizeof(encoding_name))) {
+        goto err;
+    }
+
+    /* decoded from specific params missing */
+    /* nid */
+    curve_nid = EC_GROUP_get_curve_name(group);
+    if (curve_nid != NID_undef) {
+        /* named curve */
+        const char *curve_name = OSSL_EC_curve_nid2name(curve_nid);
+        if (!curve_name || !OSSL_PARAM_BLD_push_utf8_string(bld, OSSL_PKEY_PARAM_GROUP_NAME,
+                    curve_name, sizeof(curve_name))) {
+            goto err;
+        }
+    } else {
+        /* explicit to data */
+        int fid = 0;
+        const BIGNUM *order = NULL, *cofactor = NULL;
+        unsigned char *seed = NULL;
+        const char *field_type = SN_X9_62_prime_field;
+        size_t seed_len = 0, genbuf_len = 0;
+        const EC_POINT *genpt = NULL;
+
+        /* get fid */
+        fid = EC_GROUP_get_field_type(group);
+        if (fid == NID_X9_62_characteristic_two_field) {
+#ifdef OPENSSL_NO_EC2M
+            goto err;
+#else
+            field_type = SN_X9_62_characteristic_two_field;
+#endif
+        } else {
+            goto err;
+        }
+        if (!OSSL_PARAM_BLD_push_utf8_string(bld, OSSL_PKEY_PARAM_EC_FIELD_TYPE,
+                    field_type, sizeof(field_type))) {
+            goto err;
+        }
+
+        /* get p, a, b */
+        if (!(p = BN_CTX_get(bnctx))
+                || !(a = BN_CTX_get(bnctx))
+                || !(b = BN_CTX_get(bnctx))
+                || !EC_GROUP_get_curve(group, p, a, b, bnctx)
+                || !OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_EC_P, p)
+                || !OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_EC_A, a)
+                || !OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_EC_B, b)) {
+            goto err;
+        }
+
+        /* order */
+        order = EC_GROUP_get0_order(group);
+        if (!OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_EC_ORDER, order)) {
+            goto err;
+        }
+
+        /* generator */
+        genpt = EC_GROUP_get0_generator(group);
+        genbuf_len = EC_POINT_point2buf(group, genpt, conv_form, &gen_buf, bnctx);
+        if (!OSSL_PARAM_BLD_push_octet_string(bld, OSSL_PKEY_PARAM_EC_GENERATOR, gen_buf, genbuf_len)) {
+            goto err;
+        }
+
+        /* cofactor */
+        cofactor = EC_GROUP_get0_cofactor(group);
+        if (!OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_EC_COFACTOR, cofactor)) {
+            goto err;
+        }
+
+        /* seed */
+        seed = EC_GROUP_get0_seed(group);
+        seed_len = EC_GROUP_get_seed_len(group);
+        if (!OSSL_PARAM_BLD_push_octet_string(bld, OSSL_PKEY_PARAM_EC_SEED, seed, seed_len)) {
+            goto err;
+        }
+    }
+
+    params = OSSL_PARAM_BLD_to_param(bld);
+
+ err:
+    BN_free(p);
+    BN_free(a);
+    BN_free(b);
+    OSSL_PARAM_BLD_free(bld);
+    OPENSSL_free(gen_buf);
+    BN_CTX_end(bnctx);
+    BN_CTX_free(new_bnctx);
+    return params;
 }
 #endif
