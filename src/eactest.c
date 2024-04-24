@@ -70,6 +70,9 @@
 #include <openssl/x509.h>
 #include <stdio.h>
 #include <string.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#include <openssl/core_names.h>
+#endif
 
 #define CHECK(reportverbose, test, message) do { \
     if (test) { \
@@ -2413,11 +2416,7 @@ void set_rand(void) { }
 static EVP_PKEY *
 generate_signature_key(int curve)
 {
-    RSA *rsa = NULL;
-    EC_KEY *ec = NULL;
-    DH *dh = NULL;
-    BIGNUM *bn = NULL;
-
+    EVP_PKEY_CTX *ctx = NULL;
     EVP_PKEY *key = EVP_PKEY_new();
     if (!key)
         goto err;
@@ -2426,13 +2425,27 @@ generate_signature_key(int curve)
         case 0:
         case 1:
         case 2:
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+            DH *dh = NULL;
             if (!EVP_PKEY_set_std_dp(key, curve))
                 goto err;
             dh = EVP_PKEY_get1_DH(key);
             if (!dh
                     || !DH_generate_key(dh)
-                    || !EVP_PKEY_set1_DH(key, dh))
+                    || !EVP_PKEY_set1_DH(key, dh)) {
+                DH_free(dh);
                 goto err;
+            }
+            DH_free(dh);
+#else
+            if (!(ctx = EVP_PKEY_CTX_new(key, NULL))
+                    || !EVP_PKEY_keygen_init(ctx)
+                    || !EVP_PKEY_generate(ctx, &key)) {
+                EVP_PKEY_CTX_free(ctx);
+                goto err;
+            }
+            EVP_PKEY_CTX_free(ctx);
+#endif
             break;
 
         case 8:
@@ -2446,48 +2459,69 @@ generate_signature_key(int curve)
         case 16:
         case 17:
         case 18:
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+            EC_KEY *ec = NULL;
             if (!EVP_PKEY_set_std_dp(key, curve))
                 goto err;
             ec = EVP_PKEY_get1_EC_KEY(key);
             if (!ec
                     || !EC_KEY_generate_key(ec)
-                    || !EVP_PKEY_set1_EC_KEY(key, ec))
+                    || !EVP_PKEY_set1_EC_KEY(key, ec)) {
+                    EC_KEY_free(ec);
                 goto err;
+            }
+#else
+            if (!(ctx = EVP_PKEY_CTX_new(key, NULL))
+                    || !EVP_PKEY_keygen_init(ctx)
+                    || !EVP_PKEY_generate(ctx, &key)) {
+                EVP_PKEY_CTX_free(ctx);
+                goto err;
+            }
+            EVP_PKEY_CTX_free(ctx);
+#endif
             break;
 
         default:
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
             /* RSA where curve specifies the keylength */
+            RSA *rsa = NULL;
+            BIGNUM *bn = NULL;
             if(((bn = BN_new()) == NULL)
                     || !BN_set_word(bn, RSA_F4)
                     || ((rsa = RSA_new()) == NULL)
                     || !RSA_generate_key_ex(rsa, curve, bn, NULL)
-                    || !EVP_PKEY_set1_RSA(key, rsa))
+                    || !EVP_PKEY_set1_RSA(key, rsa)) {
+                RSA_free(rsa);
+                BN_free(bn);
                 goto err;
+            }
+            BN_free(bn);
+            RSA_free(rsa);
+#else
+            OSSL_PARAM params[2];
+            EVP_PKEY_CTX *ctx = NULL;
+            
+            if (!(ctx = EVP_PKEY_CTX_new_from_name(NULL, "RSA", NULL))
+                    || EVP_PKEY_keygen_init(ctx) <= 0) {
+                EVP_PKEY_CTX_free(ctx);
+                goto err;
+            }
+            params[0] = OSSL_PARAM_construct_uint("bits", &curve);
+            params[1] = OSSL_PARAM_construct_end();
+            if (!EVP_PKEY_CTX_set_params(ctx, params)
+                    || !EVP_PKEY_generate(ctx, &key)) {
+                EVP_PKEY_CTX_free(ctx);
+                goto err;
+            }
+            EVP_PKEY_CTX_free(ctx);
+#endif
             break;
     }
-
-    if (bn)
-        BN_clear_free(bn);
-    if (rsa)
-        RSA_free(rsa);
-    if (dh)
-        DH_free(dh);
-    if (ec)
-        EC_KEY_free(ec);
 
     return key;
 
 err:
-    if (bn)
-        BN_clear_free(bn);
-    if (rsa)
-        RSA_free(rsa);
-    if (dh)
-        DH_free(dh);
-    if (ec)
-        EC_KEY_free(ec);
-    if (key)
-        EVP_PKEY_free(key);
+    EVP_PKEY_free(key);
 
     return NULL;
 }
@@ -2515,18 +2549,29 @@ check_generator(EVP_PKEY *evp_pkey, const BUF_MEM generator, BN_CTX *bn_ctx)
     DH *dh = NULL;
     EC_POINT *ec_point = NULL;
     BIGNUM *bn = NULL;
-    const BIGNUM *g;
     int ok = 0;
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     const EC_GROUP *group;
+    const BIGNUM *g;
+#else
+    EC_GROUP *group;
+    BIGNUM *g;
+    OSSL_PARAM *params = NULL;
+#endif
 
     switch (EVP_PKEY_base_id(evp_pkey)) {
         case EVP_PKEY_EC:
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
             ec_key = EVP_PKEY_get1_EC_KEY(evp_pkey);
             if (!ec_key)
                goto err;
             group = EC_KEY_get0_group(ec_key);
             if (!group)
                goto err;
+#else
+            if (!(group = EVP_PKEY_get_EC_group(evp_pkey)))
+                goto err;
+#endif
             ec_point = EC_POINT_new(group);
             if (!ec_point
                     || !EC_POINT_oct2point(group, ec_point,
@@ -2537,9 +2582,15 @@ check_generator(EVP_PKEY *evp_pkey, const BUF_MEM generator, BN_CTX *bn_ctx)
             break;
         case EVP_PKEY_DH:
         case EVP_PKEY_DHX:
-            dh = EVP_PKEY_get1_DH(evp_pkey);
             bn = BN_bin2bn((unsigned char *) generator.data, generator.length, bn);
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+            dh = EVP_PKEY_get1_DH(evp_pkey);
             DH_get0_pqg(dh, NULL, NULL, &g);
+#else
+            if (!EVP_PKEY_get_bn_param(evp_pkey, OSSL_PKEY_PARAM_FFC_G, &g)) {
+                goto err;
+            }
+#endif
             if (!dh || !bn || BN_cmp(g, bn) != 0)
                 goto err;
             break;
@@ -2551,14 +2602,15 @@ check_generator(EVP_PKEY *evp_pkey, const BUF_MEM generator, BN_CTX *bn_ctx)
     ok = 1;
 
 err:
-    if (ec_key)
-        EC_KEY_free(ec_key);
-    if (ec_point)
-        EC_POINT_clear_free(ec_point);
-    if (dh)
-        DH_free(dh);
-    if (bn)
-        BN_clear_free(bn);
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    EC_KEY_free(ec_key);
+    DH_free(dh);
+#else
+    EC_GROUP_free(group);
+    BN_free(g);
+#endif
+    EC_POINT_clear_free(ec_point);
+    BN_clear_free(bn);
 
     return ok;
 }
