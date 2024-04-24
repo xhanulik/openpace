@@ -2416,8 +2416,17 @@ void set_rand(void) { }
 static EVP_PKEY *
 generate_signature_key(int curve)
 {
-    EVP_PKEY_CTX *ctx = NULL;
     EVP_PKEY *key = EVP_PKEY_new();
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    DH *dh = NULL;
+    EC_KEY *ec = NULL;
+    RSA *rsa = NULL;
+    BIGNUM *bn = NULL;
+#else
+    EVP_PKEY_CTX *ctx = NULL;
+    OSSL_PARAM params[2];
+#endif
+
     if (!key)
         goto err;
 
@@ -2426,7 +2435,6 @@ generate_signature_key(int curve)
         case 1:
         case 2:
 #if OPENSSL_VERSION_NUMBER < 0x30000000L
-            DH *dh = NULL;
             if (!EVP_PKEY_set_std_dp(key, curve))
                 goto err;
             dh = EVP_PKEY_get1_DH(key);
@@ -2460,7 +2468,6 @@ generate_signature_key(int curve)
         case 17:
         case 18:
 #if OPENSSL_VERSION_NUMBER < 0x30000000L
-            EC_KEY *ec = NULL;
             if (!EVP_PKEY_set_std_dp(key, curve))
                 goto err;
             ec = EVP_PKEY_get1_EC_KEY(key);
@@ -2484,8 +2491,6 @@ generate_signature_key(int curve)
         default:
 #if OPENSSL_VERSION_NUMBER < 0x30000000L
             /* RSA where curve specifies the keylength */
-            RSA *rsa = NULL;
-            BIGNUM *bn = NULL;
             if(((bn = BN_new()) == NULL)
                     || !BN_set_word(bn, RSA_F4)
                     || ((rsa = RSA_new()) == NULL)
@@ -2498,8 +2503,6 @@ generate_signature_key(int curve)
             BN_free(bn);
             RSA_free(rsa);
 #else
-            OSSL_PARAM params[2];
-            EVP_PKEY_CTX *ctx = NULL;
             
             if (!(ctx = EVP_PKEY_CTX_new_from_name(NULL, "RSA", NULL))
                     || EVP_PKEY_keygen_init(ctx) <= 0) {
