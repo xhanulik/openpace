@@ -367,7 +367,11 @@ KA_CTX_clear_free(KA_CTX *ctx)
 {
     if (ctx) {
         if (ctx->cmac_ctx)
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
             CMAC_CTX_free(ctx->cmac_ctx);
+#else
+            EVP_MAC_CTX_free(ctx->cmac_ctx);
+#endif
         if (ctx->key)
             EVP_PKEY_free(ctx->key);
         if (ctx->shared_secret) {
