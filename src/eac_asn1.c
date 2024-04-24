@@ -374,7 +374,7 @@ dhparams2dh(EVP_PKEY *key, ASN1_TYPE *dh_params)
 #if OPENSSL_VERSION_NUMBER < 0x30000000L
     check(length > 0 && d2i_DHparams(&dh, &p, length),
             "Could not decode DH parameters");
-    EVP_PKEY_set1_DH_KEY(key, dh);
+    EVP_PKEY_set1_DH(key, dh);
 #else
     if (!d2i_KeyParams(EVP_PKEY_DH, &decoded_key, &p, length)) {
         goto err;
