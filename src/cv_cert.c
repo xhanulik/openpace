@@ -64,6 +64,11 @@
 #include <openssl/rsa.h>
 #include <openssl/dh.h>
 #include <openssl/stack.h>
+#include <openssl/opensslv.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+# include <openssl/param_build.h>
+# include <openssl/core_names.h>
+#endif
 #include <string.h>
 
 /** Check whether or not  a specific bit is set */
@@ -322,7 +327,7 @@ IMPLEMENT_ASN1_FUNCTIONS(CVC_CERT_AUTHENTICATION_REQUEST)
  * @param[in] bn_ctx (optional)
  */
 static int
-EAC_ec_key_from_asn1(EC_KEY **key, ASN1_OCTET_STRING *p, ASN1_OCTET_STRING *a,
+EAC_ec_key_from_asn1(EVP_PKEY *key, ASN1_OCTET_STRING *p, ASN1_OCTET_STRING *a,
         ASN1_OCTET_STRING *b, ASN1_OCTET_STRING *base, ASN1_OCTET_STRING *base_order,
         ASN1_OCTET_STRING *pub, ASN1_OCTET_STRING *cofactor, BN_CTX *bn_ctx);
 static ASN1_OCTET_STRING *
@@ -341,10 +346,10 @@ cvc_get_reference_string(ASN1_OCTET_STRING *ref);
 char *
 cvc_get_date_string(ASN1_OCTET_STRING *date);
 static int
-CVC_pubkey2rsa(const CVC_PUBKEY *public_key, EVP_PKEY *key);
+CVC_pubkey2rsa(const CVC_PUBKEY *public_key, EVP_PKEY **key);
 int
 CVC_pubkey2eckey(int all_parameters, const CVC_PUBKEY *public_key,
-        BN_CTX *bn_ctx, EVP_PKEY *key);
+        BN_CTX *bn_ctx, EVP_PKEY **key);
 
 CVC_CERT *d2i_CVC_CERT_bio(BIO *bp, CVC_CERT **cvc)
 {
@@ -487,6 +492,7 @@ CVC_pubkey2pkey(const CVC_CERT *cert, BN_CTX *bn_ctx,
     if (!cert || !cert->body || !cert->body->public_key)
         goto err;
 
+    /* Key may contain domain parameters*/
     if (key)
         tmp_key = key;
     else {
@@ -508,7 +514,7 @@ CVC_pubkey2pkey(const CVC_CERT *cert, BN_CTX *bn_ctx,
             || nid == NID_id_TA_ECDSA_SHA_256
             || nid == NID_id_TA_ECDSA_SHA_384
             || nid == NID_id_TA_ECDSA_SHA_512) {
-        if (!CVC_pubkey2eckey(all_parameters, cert->body->public_key, bn_ctx, tmp_key))
+        if (!CVC_pubkey2eckey(all_parameters, cert->body->public_key, bn_ctx, &tmp_key))
             goto err;
     } else if (nid == NID_id_TA_RSA_v1_5_SHA_1
             || nid == NID_id_TA_RSA_v1_5_SHA_256
@@ -516,7 +522,7 @@ CVC_pubkey2pkey(const CVC_CERT *cert, BN_CTX *bn_ctx,
             || nid == NID_id_TA_RSA_PSS_SHA_1
             || nid == NID_id_TA_RSA_PSS_SHA_256
             || nid == NID_id_TA_RSA_PSS_SHA_512) {
-        if (!CVC_pubkey2rsa(cert->body->public_key, tmp_key))
+        if (!CVC_pubkey2rsa(cert->body->public_key, &tmp_key))
             goto err;
     } else {
         log_err("Unknown protocol");
@@ -533,55 +539,110 @@ err:
 }
 
 static int
-CVC_pubkey2rsa(const CVC_PUBKEY *public_key, EVP_PKEY *out)
+CVC_pubkey2rsa(const CVC_PUBKEY *public_key, EVP_PKEY **out)
 {
     int ok = 0;
+    BIGNUM *n = NULL, *e = NULL;
+    EVP_PKEY *tmp = NULL;
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     RSA *rsa = NULL;
+#else
+    OSSL_PARAM_BLD *param_bld = NULL;
+    OSSL_PARAM *params = NULL, *old_params = NULL, *new_params = NULL;
+    EVP_PKEY_CTX *ctx = NULL;
+    EVP_PKEY *new_key = NULL;
+#endif
 
     if (!out || !public_key)
+        goto err;
+    
+    /* Key may contain domain parameters*/
+    if (*out)
+        tmp = *out;
+    else
+        tmp = EVP_PKEY_new();
+    
+    if (!tmp)
         goto err;
 
     /* for RSA all parameters must always be present */
     check(public_key->cont1 && public_key->cont2, "Invalid key format");
 
+    n = BN_bin2bn(public_key->cont1->data, public_key->cont1->length, NULL);
+    e = BN_bin2bn(public_key->cont2->data, public_key->cont2->length, NULL);
+
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     rsa = RSA_new();
     if (!rsa)
         goto err;
 
-    check(RSA_set0_key(rsa,
-                BN_bin2bn(public_key->cont1->data, public_key->cont1->length,
-                    NULL),
-                BN_bin2bn(public_key->cont2->data, public_key->cont2->length,
-                    NULL), NULL),
-            "Internal error");
+    check(RSA_set0_key(rsa, n,e, NULL), "Internal error");
 
-    ok = EVP_PKEY_set1_RSA(out, rsa);
+    ok = EVP_PKEY_set1_RSA(tmp, rsa);
+#else
+
+    if (!(param_bld = OSSL_PARAM_BLD_new())
+            || OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_N, n)
+            || OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_E, e)
+            || !(params = OSSL_PARAM_BLD_to_param(param_bld))) {
+        goto err;
+    }
+    if (tmp != *out) {
+        if (!EVP_PKEY_todata(*out, OSSL_KEYMGMT_SELECT_DOMAIN_PARAMETERS, &old_params)
+                || !(new_params = OSSL_PARAM_merge(old_params, params))) {
+            goto err;
+        }
+        OSSL_PARAM_free(params);
+        OSSL_PARAM_free(old_params);
+        params = new_params;
+    }
+    if (!(ctx = EVP_PKEY_CTX_new_from_name(NULL, "RSA", NULL))
+            || EVP_PKEY_fromdata_init(ctx) <= 0
+            || EVP_PKEY_fromdata(ctx, &new_key, EVP_PKEY_PUBLIC_KEY, params) <= 0) {
+        goto err;
+    }
+    EVP_PKEY_free(tmp);
+    tmp = new_key;
+#endif
+
+    *out = tmp;
+    tmp = NULL;
 
 err:
-    if (rsa)
-        RSA_free(rsa);
-
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    RSA_free(rsa);
+#else
+    OSSL_PARAM_BLD_free(param_bld);
+    OSSL_PARAM_free(params);
+    EVP_PKEY_CTX_free(ctx);
+#endif
+    EVP_PKEY_free(tmp);
+    BN_free(n);
+    BN_free(e);
     return ok;
 }
 
 int
 CVC_pubkey2eckey(int all_parameters, const CVC_PUBKEY *public_key,
-        BN_CTX *bn_ctx, EVP_PKEY *key)
+        BN_CTX *bn_ctx, EVP_PKEY **key)
 {
-    EC_KEY *ec = NULL;
-    const EC_GROUP *group;
-    EC_POINT *point = NULL;
     int ok = 0;
+    EVP_PKEY *tmp = NULL, *new_key = NULL;
 
     if (!public_key || !key)
         goto err;
+    
+    /* Key may contain domain parameters */
+    if (*key)
+        tmp = *key;
+    else
+        tmp = EVP_PKEY_new();
+    
+    if (!tmp)
+        goto err;
 
     if (all_parameters) {
-        ec = EC_KEY_new();
-        if (!ec)
-            goto err;
-
-        if (!EAC_ec_key_from_asn1(&ec, public_key->cont1,
+        if (!EAC_ec_key_from_asn1(tmp, public_key->cont1,
                     public_key->cont2,
                     public_key->cont3,
                     public_key->cont4,
@@ -592,9 +653,17 @@ CVC_pubkey2eckey(int all_parameters, const CVC_PUBKEY *public_key,
             log_err("Internal error");
             goto err;
         }
-
-        ok = EVP_PKEY_set1_EC_KEY(key, ec);
     } else {
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+        EC_POINT *point = NULL;
+        EC_KEY *ec = NULL;
+        const EC_GROUP *group;
+#else
+        EVP_PKEY_CTX *ctx = NULL;
+        OSSL_PARAM_BLD *param_bld = NULL;
+        OSSL_PARAM *params = NULL, *old_params = NULL, *new_params = NULL;
+        EC_GROUP *group = NULL;
+#endif
         /* If cert is not a CVCA certificate it MUST NOT contain any domain
          * parameters. We take the domain parameters from the domainParameters
          * parameter and the public point from the certificate. */
@@ -607,10 +676,11 @@ CVC_pubkey2eckey(int all_parameters, const CVC_PUBKEY *public_key,
                 && !public_key->cont7),
             "Invalid key format");
 
-        check(EVP_PKEY_base_id(key) == EVP_PKEY_EC,
+        check(EVP_PKEY_base_id(tmp) == EVP_PKEY_EC,
                "Incorrect domain parameters");
 
-        ec = EVP_PKEY_get1_EC_KEY(key);
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+        ec = EVP_PKEY_get1_EC_KEY(tmp);
         check(ec, "Failed to extract domain parameters");
 
         group = EC_KEY_get0_group(ec);
@@ -623,16 +693,48 @@ CVC_pubkey2eckey(int all_parameters, const CVC_PUBKEY *public_key,
                 && EC_KEY_set_public_key(ec, point)
                 && EC_KEY_check_key(ec),
                 "Internal error");
+        EC_POINT_free(point);
+#else
+        if ((param_bld = OSSL_PARAM_BLD_new())
+                || !OSSL_PARAM_BLD_push_octet_string(param_bld, "pub", public_key->cont6->data,
+                        public_key->cont6->length)) {
+            log_err("Internal error");
+            OSSL_PARAM_BLD_free(param_bld);
+            goto err;
+        }
+        params = OSSL_PARAM_BLD_to_param(param_bld);
+        OSSL_PARAM_BLD_free(param_bld);
+        if (tmp != *key) { /* Key may contain domain parameters*/
+            if (!EVP_PKEY_todata(*key, EVP_PKEY_KEY_PARAMETERS, &old_params)
+                    || !(new_params = OSSL_PARAM_merge(old_params, params))) {
+                goto err;
+            }
+            OSSL_PARAM_free(old_params);
+            OSSL_PARAM_free(params);
+            params = new_params;
+        }
+        if (!(params)
+                || !(ctx = EVP_PKEY_CTX_new_from_name(NULL, "EC", NULL))
+                || EVP_PKEY_fromdata_init(ctx) <= 0
+                || EVP_PKEY_fromdata(ctx, &new_key, EVP_PKEY_KEYPAIR, params) <= 0) {
+            log_err("Internal error");
+            EVP_PKEY_CTX_free(ctx);
+            OSSL_PARAM_free(params);
+            goto err;
+        }
+        EVP_PKEY_CTX_free(ctx);
+        OSSL_PARAM_free(params);
 
+        EVP_PKEY_free(tmp);
+        tmp = new_key;
+#endif
         ok = 1;
     }
+    *key = tmp;
+    tmp = NULL;
 
 err:
-    if (point)
-        EC_POINT_free(point);
-    if (ec)
-        EC_KEY_free(ec);
-
+    EVP_PKEY_free(tmp);
     return ok;
 }
 
@@ -716,7 +818,7 @@ CVC_verify_request_signature(const CVC_CERT_REQUEST *request)
             || nid == NID_id_TA_ECDSA_SHA_256
             || nid == NID_id_TA_ECDSA_SHA_384
             || nid == NID_id_TA_ECDSA_SHA_512) {
-        if (!CVC_pubkey2eckey(1, request->body->public_key, NULL, key))
+        if (!CVC_pubkey2eckey(1, request->body->public_key, NULL, &key))
             goto err;
     } else if (nid == NID_id_TA_RSA_v1_5_SHA_1
             || nid == NID_id_TA_RSA_v1_5_SHA_256
@@ -724,7 +826,7 @@ CVC_verify_request_signature(const CVC_CERT_REQUEST *request)
             || nid == NID_id_TA_RSA_PSS_SHA_1
             || nid == NID_id_TA_RSA_PSS_SHA_256
             || nid == NID_id_TA_RSA_PSS_SHA_512) {
-        if (!CVC_pubkey2rsa(request->body->public_key, key))
+        if (!CVC_pubkey2rsa(request->body->public_key, &key))
             goto err;
     } else {
         log_err("Unknown protocol");
@@ -1241,7 +1343,13 @@ static int CVC_eckey2pubkey(int all_parameters,
         EVP_PKEY *key, BN_CTX *bn_ctx, CVC_PUBKEY *out)
 {
     EC_KEY *ec = NULL;
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     const EC_GROUP *group;
+#else
+    char group_name[256];
+    EC_GROUP *group;
+    int nid = 0;
+#endif
     int ok = 0;
     BIGNUM *a_bn = NULL, *b_bn = NULL, *bn = NULL;
     BUF_MEM *Y_buf = NULL, *G_buf = NULL;
@@ -1249,15 +1357,10 @@ static int CVC_eckey2pubkey(int all_parameters,
     check(out && key && bn_ctx, "Invalid Arguments");
 
     BN_CTX_start(bn_ctx);
-    ec = EVP_PKEY_get1_EC_KEY(key);
-    check(ec, "Could not get EC key");
-
-    group = EC_KEY_get0_group(ec);
-    if (!group)
-        goto err;
+    group = EVP_PKEY_get_EC_group(key);
 
     /* Public point */
-    Y_buf = EC_POINT_point2mem(ec, bn_ctx, EC_KEY_get0_public_key(ec));
+    Y_buf = EVP_PKEY_pubkey2mem(key, bn_ctx);
     out->cont6 = ASN1_OCTET_STRING_new();
     if (!Y_buf || !out->cont6 ||
             !ASN1_OCTET_STRING_set(out->cont6,
@@ -1271,8 +1374,13 @@ static int CVC_eckey2pubkey(int all_parameters,
         bn = BN_CTX_get(bn_ctx);
         a_bn = BN_CTX_get(bn_ctx);
         b_bn = BN_CTX_get(bn_ctx);
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
         if (!EC_GROUP_get_curve_GFp(group, bn, a_bn, b_bn, bn_ctx))
             goto err;
+#else
+        if (!EC_GROUP_get_curve(group, bn, a_bn, b_bn, bn_ctx))
+            goto err;
+#endif
 
         /* Prime modulus */
         out->cont1 = BN_to_ASN1_UNSIGNED_INTEGER(bn, out->cont1);
@@ -1284,8 +1392,7 @@ static int CVC_eckey2pubkey(int all_parameters,
         out->cont3 = BN_to_ASN1_UNSIGNED_INTEGER(b_bn, out->cont3);
 
         /* Base Point */
-        G_buf = EC_POINT_point2mem(ec, bn_ctx,
-                EC_GROUP_get0_generator(group));
+        G_buf = EC_POINT_point2mem(key, bn_ctx, EC_GROUP_get0_generator(group));
         out->cont4 = ASN1_OCTET_STRING_new();
         if (!out->cont4
                 || !ASN1_OCTET_STRING_set(out->cont4,
@@ -1310,12 +1417,9 @@ static int CVC_eckey2pubkey(int all_parameters,
     ok = 1;
 
 err:
-    if (ec)
-        EC_KEY_free(ec);
-    if (Y_buf)
-        BUF_MEM_free(Y_buf);
-    if (G_buf)
-        BUF_MEM_free(G_buf);
+    EC_GROUP_free(group);
+    BUF_MEM_free(Y_buf);
+    BUF_MEM_free(G_buf);
     BN_CTX_end(bn_ctx);
 
     return ok;
@@ -1323,16 +1427,28 @@ err:
 
 static int CVC_rsa2pubkey(EVP_PKEY *key, CVC_PUBKEY *out)
 {
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     RSA *rsa = NULL;
-    int ok = 0;
     const BIGNUM *n, *e;
+#else
+    BIGNUM *n = NULL, *e = NULL;
+#endif
+    int ok = 0;
 
     check(key && out, "Invalid Arguments");
 
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     rsa = EVP_PKEY_get1_RSA(key);
     check(rsa, "Could not get RSA key");
 
     RSA_get0_key(rsa, &n, &e, NULL);
+#else
+    if (!EVP_PKEY_get_bn_param(key, OSSL_PKEY_PARAM_RSA_N, &n)
+            || !EVP_PKEY_get_bn_param(key, OSSL_PKEY_PARAM_RSA_E, &e)) {
+		goto err;
+	}
+#endif
+
     out->cont1 = BN_to_ASN1_UNSIGNED_INTEGER(n, out->cont1);
     out->cont2 = BN_to_ASN1_UNSIGNED_INTEGER(e, out->cont2);
     if (!out->cont1 || !out->cont2)
@@ -1341,8 +1457,12 @@ static int CVC_rsa2pubkey(EVP_PKEY *key, CVC_PUBKEY *out)
     ok = 1;
 
 err:
-    if (rsa)
-        RSA_free(rsa);
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    RSA_free(rsa);
+#else
+    BN_free(n);
+    BN_free(e);
+#endif
 
     return ok;
 }
@@ -1350,30 +1470,68 @@ err:
 static int CVC_dh2pubkey(int all_parameters, EVP_PKEY *key, BN_CTX *bn_ctx,
         CVC_PUBKEY *out)
 {
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     DH *dh = NULL;
-    BIGNUM *bn = NULL;
     const BIGNUM *pub_key, *p, *g;
+#else
+    OSSL_PARAM *pkey_params = NULL;
+    size_t pub_len = 0;
+    unsigned char *pubkey = NULL;
+    ASN1_OCTET_STRING *asn1_pubkey = NULL;
+    BIGNUM *p, *g;
+#endif
+    BIGNUM *bn = NULL;
     int ok = 0;
 
     check(out, "Invalid argument");
 
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     dh = EVP_PKEY_get1_DH(key);
     check(dh, "Could not get DH key");
-
-    /* Public value */
     DH_get0_key(dh, &pub_key, NULL);
     out->cont4 = BN_to_ASN1_UNSIGNED_INTEGER(pub_key, out->cont4);
     if (!out->cont4)
         goto err;
+#else
+    if (!EVP_PKEY_get_octet_string_param(key, OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY, NULL, 0, &pub_len)
+            || (pubkey = malloc(pub_len)) == NULL
+            || !EVP_PKEY_get_octet_string_param(key, OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY, pubkey, pub_len, NULL)) {
+        log_err("Could not extract DH key from EVP_PKEY");
+        free(pubkey);
+        goto err;
+    }
+    if (!out->cont4) {
+        asn1_pubkey = ASN1_OCTET_STRING_new();
+    } else {
+        asn1_pubkey = out->cont4;
+    }
+    if (!out->cont4
+            || !ASN1_OCTET_STRING_set(asn1_pubkey, pubkey, pub_len)) {
+        log_err("Could not extract DH key from EVP_PKEY");
+        free(pubkey);
+        goto err;
+    }
+#endif
 
     if (all_parameters) {
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
         DH_get0_pqg(dh, &p, NULL, &g);
+#else
+    if (!EVP_PKEY_get_bn_param(key, OSSL_PKEY_PARAM_FFC_P, &p)
+            || !EVP_PKEY_get_bn_param(key, OSSL_PKEY_PARAM_FFC_G, &g)) {
+        goto err;
+    }
+#endif
 
         /* Prime modulus */
         out->cont1 = BN_to_ASN1_UNSIGNED_INTEGER(p, out->cont1);
 
         /* Order of the subgroup */
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
         bn = DH_get_order(dh, bn_ctx);
+#else
+        bn = DH_get_order(key, bn_ctx);
+#endif
         if (!bn)
             goto err;
         out->cont2 = BN_to_ASN1_UNSIGNED_INTEGER(bn, out->cont2);
@@ -1388,10 +1546,10 @@ static int CVC_dh2pubkey(int all_parameters, EVP_PKEY *key, BN_CTX *bn_ctx,
     ok = 1;
 
 err:
-    if (bn)
-        BN_free(bn);
-    if (dh)
-        DH_free(dh);
+    BN_free(bn);
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    DH_free(dh);
+#endif
 
     return ok;
 }
@@ -1453,7 +1611,7 @@ err:
 }
 
 static int
-EAC_ec_key_from_asn1(EC_KEY **key, ASN1_OCTET_STRING *p, ASN1_OCTET_STRING *a,
+EAC_ec_key_from_asn1(EVP_PKEY *key, ASN1_OCTET_STRING *p, ASN1_OCTET_STRING *a,
         ASN1_OCTET_STRING *b, ASN1_OCTET_STRING *base, ASN1_OCTET_STRING *base_order,
         ASN1_OCTET_STRING *pub, ASN1_OCTET_STRING *cofactor, BN_CTX *bn_ctx)
 {
@@ -1461,12 +1619,25 @@ EAC_ec_key_from_asn1(EC_KEY **key, ASN1_OCTET_STRING *p, ASN1_OCTET_STRING *a,
     BIGNUM *p_bn = NULL, *cofactor_bn = NULL, *order_bn = NULL, *a_bn = NULL,
             *b_bn = NULL;
     EC_GROUP *group = NULL;
-    EC_POINT *generator = NULL, *pub_point = NULL;
-    EC_KEY *tmp = NULL;
+    EC_POINT *pub_point = NULL;
     BN_CTX *lcl_bn_ctx = NULL;
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    EC_KEY *ec = NULL;
+    EC_POINT *generator = NULL;
+#else
+    EVP_PKEY_CTX *ctx = NULL;
+    OSSL_PARAM_BLD *param_bld = NULL;
+    OSSL_PARAM *params = NULL;
+#endif
 
     check((key && p && a && b  && base  && base_order  && cofactor),
             "Invalid arguments");
+    
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    ec = EC_KEY_new();
+    if (!ec)
+        goto err;
+#endif
 
     if (bn_ctx)
         lcl_bn_ctx = bn_ctx;
@@ -1490,9 +1661,8 @@ EAC_ec_key_from_asn1(EC_KEY **key, ASN1_OCTET_STRING *p, ASN1_OCTET_STRING *a,
         !BN_bin2bn(ASN1_STRING_get0_data(a), ASN1_STRING_length(a), a_bn) ||
         !BN_bin2bn(ASN1_STRING_get0_data(b), ASN1_STRING_length(b), b_bn))
             goto err;
-    else
-        group = EC_GROUP_new_curve_GFp(p_bn, a_bn, b_bn, lcl_bn_ctx);
 
+    group = EC_GROUP_new_curve_GFp(p_bn, a_bn, b_bn, lcl_bn_ctx);
     if (!group)
         goto err;
 
@@ -1501,6 +1671,7 @@ EAC_ec_key_from_asn1(EC_KEY **key, ASN1_OCTET_STRING *p, ASN1_OCTET_STRING *a,
         !BN_bin2bn(ASN1_STRING_get0_data(base_order), ASN1_STRING_length(base_order), order_bn))
             goto err;
 
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     generator = EC_POINT_new(group);
     if (!generator)
         goto err;
@@ -1512,19 +1683,25 @@ EAC_ec_key_from_asn1(EC_KEY **key, ASN1_OCTET_STRING *p, ASN1_OCTET_STRING *a,
     if (!EC_GROUP_set_generator(group, generator, order_bn, cofactor_bn))
         goto err;
 
-    if (!*key) {
-        tmp = EC_KEY_new();
-        if(!tmp)
-            goto err;
-    } else
-        tmp = *key;
-
     /* Set the group for the key*/
-    if(!EC_KEY_set_group(tmp, group))
+    if(!EC_KEY_set_group(ec, group))
         goto err;
+#else
+    if (!(param_bld = OSSL_PARAM_BLD_new())
+            || !OSSL_PARAM_BLD_push_utf8_string(param_bld, OSSL_PKEY_PARAM_EC_GENERATOR, ASN1_STRING_get0_data(base), 0)
+            || !OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_EC_COFACTOR, cofactor_bn)
+            || !OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_EC_ORDER, order_bn)
+            || !OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_EC_P, p_bn)
+            || !OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_EC_A, a_bn)
+            || !OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_EC_B, b_bn)) {
+        OSSL_PARAM_BLD_free(param_bld);
+        goto err;
+    }
+#endif
 
     /* Set the public point if available */
     if (pub) {
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
         pub_point = EC_POINT_new(group);
         if (!pub_point)
             goto err;
@@ -1532,30 +1709,31 @@ EAC_ec_key_from_asn1(EC_KEY **key, ASN1_OCTET_STRING *p, ASN1_OCTET_STRING *a,
         if (!EC_POINT_oct2point(group, pub_point, ASN1_STRING_get0_data(pub),
                 ASN1_STRING_length(pub), lcl_bn_ctx))
             goto err;
-
-        if (!EC_KEY_set_public_key(tmp, pub_point))
+        if (!EC_KEY_set_public_key(ec, pub_point))
             goto err;
+#else
+        if (!OSSL_PARAM_BLD_push_octet_string(param_bld, OSSL_PKEY_PARAM_PUB_KEY, ASN1_STRING_get0_data(pub), ASN1_STRING_length(pub))) {
+            OSSL_PARAM_BLD_free(param_bld);
+            goto err;
+        }
+#endif
     }
 
-    if (!*key)
-        *key = tmp;
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+   EVP_PKEY_set1_EC_KEY(key, ec);
+#endif
 
     ret = 1;
 
 err:
-    if (!ret && tmp && key && !*key)
-        EC_KEY_free(tmp);
-    if (group)
-        EC_GROUP_clear_free(group);
-    if (generator)
-        EC_POINT_clear_free(generator);
-    if (pub_point)
-        EC_POINT_clear_free(pub_point);
-    if (lcl_bn_ctx)
-        BN_CTX_end(lcl_bn_ctx);
-    if (!bn_ctx && lcl_bn_ctx) {
-        BN_CTX_free(lcl_bn_ctx);
-    }
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    EC_KEY_free(ec);
+    EC_POINT_clear_free(generator);
+    EC_POINT_clear_free(pub_point);
+#endif
+    EC_GROUP_free(group);
+    BN_CTX_end(lcl_bn_ctx);
+    BN_CTX_free(lcl_bn_ctx);
 
     return ret;
 }
