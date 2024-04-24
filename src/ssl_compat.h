@@ -65,6 +65,8 @@ EVP_PKEY *
 EVP_PKEY_dup(EVP_PKEY *key);
 #endif
 
-#ifndef EC_GROUP_to_params
+#ifndef HAVE_EC_GROUP_to_params
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
 OSSL_PARAM *EC_GROUP_to_params(const EC_GROUP *group, OSSL_LIB_CTX *libctx, const char *propq, BN_CTX *bnctx);
+#endif
 #endif

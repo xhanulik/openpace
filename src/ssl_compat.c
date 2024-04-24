@@ -268,6 +268,7 @@ err:
 #endif
 
 #ifndef HAVE_EC_GROUP_to_params
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
 OSSL_PARAM *EC_GROUP_to_params(const EC_GROUP *group, OSSL_LIB_CTX *libctx,
                                const char *propq, BN_CTX *bnctx)
 {
@@ -405,4 +406,5 @@ OSSL_PARAM *EC_GROUP_to_params(const EC_GROUP *group, OSSL_LIB_CTX *libctx,
     BN_CTX_free(new_bnctx);
     return params;
 }
+#endif
 #endif
