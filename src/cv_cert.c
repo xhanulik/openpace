@@ -1342,8 +1342,8 @@ err:
 static int CVC_eckey2pubkey(int all_parameters,
         EVP_PKEY *key, BN_CTX *bn_ctx, CVC_PUBKEY *out)
 {
-    EC_KEY *ec = NULL;
 #if OPENSSL_VERSION_NUMBER < 0x30000000L
+    EC_KEY *ec = NULL;
     const EC_GROUP *group;
 #else
     char group_name[256];
@@ -1392,7 +1392,13 @@ static int CVC_eckey2pubkey(int all_parameters,
         out->cont3 = BN_to_ASN1_UNSIGNED_INTEGER(b_bn, out->cont3);
 
         /* Base Point */
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+        ec = EVP_PKEY_get1_EC_KEY(key);
+        check(ec, "Failed to extract domain parameters");
+        G_buf = EC_POINT_point2mem(ec, bn_ctx, EC_GROUP_get0_generator(group));
+#else
         G_buf = EC_POINT_point2mem(key, bn_ctx, EC_GROUP_get0_generator(group));
+#endif
         out->cont4 = ASN1_OCTET_STRING_new();
         if (!out->cont4
                 || !ASN1_OCTET_STRING_set(out->cont4,
@@ -1417,7 +1423,9 @@ static int CVC_eckey2pubkey(int all_parameters,
     ok = 1;
 
 err:
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
     EC_GROUP_free(group);
+#endif
     BUF_MEM_free(Y_buf);
     BUF_MEM_free(G_buf);
     BN_CTX_end(bn_ctx);
