@@ -69,6 +69,7 @@ case "$1" in
         make check
         sudo make install
         make distcheck
+        ./src/eactest
         sudo make uninstall
         ;;
     ape|macos)
