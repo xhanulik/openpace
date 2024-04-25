@@ -333,10 +333,8 @@ EVP_PKEY_get_EC_group(const EVP_PKEY *key)
 #endif
     EC_GROUP *group = NULL;
 
-    if (!EVP_PKEY_is_a(key, "EC"))
-        goto err;
 #if OPENSSL_VERSION_NUMBER < 0x30000000L
-    ec = EVP_PKEY_get1_EC_KEY(key);
+    ec = EVP_PKEY_get0_EC_KEY(key);
     if (!ec)
         goto err;
     ec_group = EC_KEY_get0_group(ec);
@@ -348,9 +346,7 @@ EVP_PKEY_get_EC_group(const EVP_PKEY *key)
 #endif
 
 err:
-#if OPENSSL_VERSION_NUMBER < 0x30000000L
-    EC_KEY_free(ec);
-#else
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
     OSSL_PARAM_free(params);
 #endif
     return group;
