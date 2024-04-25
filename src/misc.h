@@ -105,6 +105,9 @@ BN_bn2buf(const BIGNUM *bn);
 BUF_MEM *
 EC_POINT_point2mem(const EC_KEY * ecdh, BN_CTX * bn_ctx, const EC_POINT * ecp);
 
+EC_GROUP *
+EVP_PKEY_get_EC_group(const EVP_PKEY *key);
+
 #ifdef HAVE_EC_KEY_METHOD
 const EC_KEY_METHOD *EC_KEY_OpenSSL_Point(void);
 #else

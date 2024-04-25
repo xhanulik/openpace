@@ -53,6 +53,8 @@
 #include <openssl/ecdh.h>
 #include <openssl/ecdsa.h>
 #include <openssl/ossl_typ.h>
+#include <openssl/evp.h>
+#include <openssl/core.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -316,4 +318,38 @@ EC_POINT_point2mem(const EC_KEY * ecdh, BN_CTX * bn_ctx, const EC_POINT * ecp)
             bn_ctx);
 
     return out;
+}
+
+EC_GROUP *
+EVP_PKEY_get_EC_group(const EVP_PKEY *key)
+{
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    EC_KEY *ec = NULL;
+    const EC_GROUP *ec_group = NULL;
+#else
+    OSSL_PARAM *params = NULL;
+#endif
+    EC_GROUP *group = NULL;
+
+    if (!EVP_PKEY_is_a(key, "EC"))
+        goto err;
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    ec = EVP_PKEY_get1_EC_KEY(key);
+    if (!ec)
+        goto err;
+    ec_group = EC_KEY_get0_group(ec);
+    group = EC_GROUP_dup(ec_group);
+#else
+    if (!EVP_PKEY_todata(key, EVP_PKEY_KEY_PARAMETERS, &params))
+        goto err;
+    group = EC_GROUP_new_from_params(params, NULL, NULL);
+#endif
+
+err:
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    EC_KEY_free(ec);
+#else
+    OSSL_PARAM_free(params);
+#endif
+    return group;
 }
