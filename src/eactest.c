@@ -68,6 +68,9 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/x509.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#include <openssl/core_names.h>
+#endif
 #include <stdio.h>
 #include <string.h>
 
@@ -2566,16 +2569,23 @@ EVP_PKEY_set_keys_buf(EVP_PKEY *evp_pkey,
 static int
 check_generator(EVP_PKEY *evp_pkey, const BUF_MEM generator, BN_CTX *bn_ctx)
 {
+    BIGNUM *bn = NULL;
+    int ok = 0;
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    const EC_GROUP *group;
     EC_KEY *ec_key = NULL;
     DH *dh = NULL;
     EC_POINT *ec_point = NULL;
-    BIGNUM *bn = NULL;
     const BIGNUM *g;
-    int ok = 0;
-    const EC_GROUP *group;
+#else
+    unsigned char *buffer;
+    size_t buffer_len = 0;
+    BIGNUM *g = NULL;
+#endif
 
     switch (EVP_PKEY_base_id(evp_pkey)) {
         case EVP_PKEY_EC:
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
             ec_key = EVP_PKEY_get1_EC_KEY(evp_pkey);
             if (!ec_key)
                goto err;
@@ -2588,15 +2598,29 @@ check_generator(EVP_PKEY *evp_pkey, const BUF_MEM generator, BN_CTX *bn_ctx)
                         (unsigned char *) generator.data, generator.length, bn_ctx)
                     || EC_POINT_cmp(group, ec_point,
                         EC_GROUP_get0_generator(group), bn_ctx) != 0)
-                goto err;
+#else
+            /* get generator from evp_pkey directly and compare */
+            if (!EVP_PKEY_get_octet_string_param(evp_pkey, OSSL_PKEY_PARAM_EC_GENERATOR, NULL, 0, &buffer_len) // OPENSSL_TODO: cannot get param
+                    || !(buffer = malloc(buffer_len))
+                    || !EVP_PKEY_get_octet_string_param(evp_pkey, OSSL_PKEY_PARAM_EC_GENERATOR, buffer, buffer_len, NULL)) {
+                goto err;    
+            }
+#endif
             break;
         case EVP_PKEY_DH:
         case EVP_PKEY_DHX:
-            dh = EVP_PKEY_get1_DH(evp_pkey);
             bn = BN_bin2bn((unsigned char *) generator.data, generator.length, bn);
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+            dh = EVP_PKEY_get1_DH(evp_pkey);
             DH_get0_pqg(dh, NULL, NULL, &g);
             if (!dh || !bn || BN_cmp(g, bn) != 0)
                 goto err;
+#else
+            if (!EVP_PKEY_get_bn_param(evp_pkey, OSSL_PKEY_PARAM_FFC_G, &g)
+                    || BN_cmp(g, bn)) {
+                goto err;
+            }
+#endif
             break;
         default:
             goto err;
@@ -2606,14 +2630,15 @@ check_generator(EVP_PKEY *evp_pkey, const BUF_MEM generator, BN_CTX *bn_ctx)
     ok = 1;
 
 err:
-    if (ec_key)
-        EC_KEY_free(ec_key);
-    if (ec_point)
-        EC_POINT_clear_free(ec_point);
-    if (dh)
-        DH_free(dh);
-    if (bn)
-        BN_clear_free(bn);
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    EC_KEY_free(ec_key);
+    DH_free(dh);
+    EC_POINT_clear_free(ec_point);
+#else
+    free(buffer);
+    BN_free(g);
+#endif
+    BN_clear_free(bn);
 
     return ok;
 }
