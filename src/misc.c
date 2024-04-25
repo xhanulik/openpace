@@ -54,7 +54,9 @@
 #include <openssl/ecdsa.h>
 #include <openssl/ossl_typ.h>
 #include <openssl/evp.h>
-#include <openssl/core.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+# include <openssl/core.h>
+#endif
 #include <stdint.h>
 #include <string.h>
 
