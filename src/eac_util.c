@@ -812,8 +812,11 @@ err:
 }
 
 int EVP_PKEY_set_std_dp(EVP_PKEY *key, int stnd_dp) {
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     EC_KEY *ec = NULL;
-
+    DH *dh = NULL;
+#else
+#endif
     if (!key) {
         log_err("Invalid arguments");
         return 0;
@@ -825,7 +828,6 @@ int EVP_PKEY_set_std_dp(EVP_PKEY *key, int stnd_dp) {
         case 1:
         case 2:
 #if OPENSSL_VERSION_NUMBER < 0x30000000L
-            DH *dh = NULL;
             if (!init_dh(&dh, stnd_dp))
                 return 0;
             EVP_PKEY_set1_DH(key, dh);
@@ -849,7 +851,6 @@ int EVP_PKEY_set_std_dp(EVP_PKEY *key, int stnd_dp) {
         case 17:
         case 18:
 #if OPENSSL_VERSION_NUMBER < 0x30000000L
-            EC_KEY *ec = NULL;
             if (!init_ecdh(&ec, stnd_dp))
                 return 0;
             EVP_PKEY_set1_EC_KEY(key, ec);
@@ -890,7 +891,7 @@ EVP_PKEY_set_keys(EVP_PKEY *evp_pkey,
     BIGNUM *bn = NULL, *dh_pub_key, *dh_priv_key;
     int ok = 0;
 #if OPENSSL_VERSION_NUMBER < 0x30000000L
-    const EC_GROUP *group;
+    EC_GROUP *group;
 #else
     OSSL_PARAM_BLD *param_bld = NULL;
     OSSL_PARAM *params = NULL, *old_params = NULL, *new_params = NULL;
