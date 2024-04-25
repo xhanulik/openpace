@@ -2413,10 +2413,16 @@ void set_rand(void) { }
 static EVP_PKEY *
 generate_signature_key(int curve)
 {
-    RSA *rsa = NULL;
-    EC_KEY *ec = NULL;
-    DH *dh = NULL;
     BIGNUM *bn = NULL;
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    DH *dh = NULL;
+    EC_KEY *ec = NULL;
+    RSA *rsa = NULL;
+#else
+    EVP_PKEY_CTX *ctx = NULL;
+    OSSL_PARAM params[2];
+#endif
+
 
     EVP_PKEY *key = EVP_PKEY_new();
     if (!key)
@@ -2428,11 +2434,22 @@ generate_signature_key(int curve)
         case 2:
             if (!EVP_PKEY_set_std_dp(key, curve))
                 goto err;
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
             dh = EVP_PKEY_get1_DH(key);
             if (!dh
                     || !DH_generate_key(dh)
-                    || !EVP_PKEY_set1_DH(key, dh))
+                    || !EVP_PKEY_set1_DH(key, dh)) {
+                DH_free(dh);
                 goto err;
+            }
+            DH_free(dh);
+#else
+            if (!(ctx = EVP_PKEY_CTX_new(key, NULL))
+                    || !EVP_PKEY_keygen_init(ctx)
+                    || !EVP_PKEY_generate(ctx, &key)) {
+                goto err;
+            }
+#endif
             break;
 
         case 8:
@@ -2448,44 +2465,82 @@ generate_signature_key(int curve)
         case 18:
             if (!EVP_PKEY_set_std_dp(key, curve))
                 goto err;
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
             ec = EVP_PKEY_get1_EC_KEY(key);
             if (!ec
                     || !EC_KEY_generate_key(ec)
-                    || !EVP_PKEY_set1_EC_KEY(key, ec))
+                    || !EVP_PKEY_set1_EC_KEY(key, ec)) {
+                    EC_KEY_free(ec);
                 goto err;
+            }
+#else
+            if (!(ctx = EVP_PKEY_CTX_new(key, NULL))
+                    || !EVP_PKEY_keygen_init(ctx)
+                    || !EVP_PKEY_generate(ctx, &key)) {
+
+                goto err;
+            }
+#endif
             break;
 
         default:
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
             /* RSA where curve specifies the keylength */
             if(((bn = BN_new()) == NULL)
                     || !BN_set_word(bn, RSA_F4)
                     || ((rsa = RSA_new()) == NULL)
                     || !RSA_generate_key_ex(rsa, curve, bn, NULL)
-                    || !EVP_PKEY_set1_RSA(key, rsa))
+                    || !EVP_PKEY_set1_RSA(key, rsa)) {
+                RSA_free(rsa);
+                BN_free(bn);
                 goto err;
+            }
+            BN_free(bn);
+            RSA_free(rsa);
+#else
+            
+            if (!(ctx = EVP_PKEY_CTX_new_from_name(NULL, "RSA", NULL))
+                    || EVP_PKEY_keygen_init(ctx) <= 0) {
+                goto err;
+            }
+            params[0] = OSSL_PARAM_construct_uint("bits", &curve);
+            params[1] = OSSL_PARAM_construct_end();
+            if (!EVP_PKEY_CTX_set_params(ctx, params)
+                    || !EVP_PKEY_generate(ctx, &key)) {
+                goto err;
+            }
+#endif
             break;
     }
 
     if (bn)
         BN_clear_free(bn);
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     if (rsa)
         RSA_free(rsa);
     if (dh)
         DH_free(dh);
     if (ec)
         EC_KEY_free(ec);
+#else
+    EVP_PKEY_CTX_free(ctx);
+#endif
 
     return key;
 
 err:
     if (bn)
         BN_clear_free(bn);
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     if (rsa)
         RSA_free(rsa);
     if (dh)
         DH_free(dh);
     if (ec)
         EC_KEY_free(ec);
+#else
+    EVP_PKEY_CTX_free(ctx);
+#endif
     if (key)
         EVP_PKEY_free(key);
 
