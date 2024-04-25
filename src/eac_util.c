@@ -63,6 +63,10 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/rsa.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+# include <openssl/param_build.h>
+# include <openssl/core_names.h>
+#endif
 
 /**
  * @brief Wrapper to the OpenSSL encryption functions.
@@ -843,16 +847,24 @@ EVP_PKEY_set_keys(EVP_PKEY *evp_pkey,
     EC_POINT *ec_point = NULL;
     BIGNUM *bn = NULL, *dh_pub_key, *dh_priv_key;
     int ok = 0;
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     const EC_GROUP *group;
+#else
+    OSSL_PARAM_BLD *param_bld = NULL;
+    OSSL_PARAM *params = NULL, *old_params = NULL, *new_params = NULL;
+    EVP_PKEY *new_key = NULL;
+    EVP_PKEY_CTX *ctx = NULL;
+#endif
 
     check(evp_pkey, "Invalid arguments");
 
     switch (EVP_PKEY_base_id(evp_pkey)) {
         case EVP_PKEY_EC:
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
             ec_key = EVP_PKEY_get1_EC_KEY(evp_pkey);
             if (!ec_key)
                 goto err;
-            group = EC_KEY_get0_group(ec_key);
+            group = EVP_PKEY_get_EC_group(evp_pkey);
 
             if (pubkey) {
                 ec_point = EC_POINT_new(group);
@@ -870,10 +882,37 @@ EVP_PKEY_set_keys(EVP_PKEY *evp_pkey,
 
             if (!EVP_PKEY_set1_EC_KEY(evp_pkey, ec_key))
                 goto err;
+#else
+
+            if (!(param_bld = OSSL_PARAM_BLD_new())) {
+                goto err;
+            }
+            if (pubkey) {
+                if (!OSSL_PARAM_BLD_push_octet_string(param_bld, OSSL_PKEY_PARAM_PUB_KEY,
+                        pubkey, pubkey_len))
+                    goto err;
+            }
+            if (privkey) {
+                bn = BN_bin2bn(privkey, privkey_len, bn);
+                if (!bn || !OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_PRIV_KEY, bn))
+                    goto err;
+            }
+            if (!(params = OSSL_PARAM_BLD_to_param(param_bld))
+                    || !EVP_PKEY_todata(evp_pkey, EVP_PKEY_KEY_PARAMETERS, &old_params)
+                    || !(new_params = OSSL_PARAM_merge(old_params, params))) {
+                goto err;
+            }
+            if (!(ctx = EVP_PKEY_CTX_new_from_name(NULL, "EC", NULL))
+                    || EVP_PKEY_fromdata_init(ctx) <= 0
+                    || EVP_PKEY_fromdata(ctx, &new_key, EVP_PKEY_KEYPAIR, new_params) <= 0) {
+                goto err;
+            }
+#endif
             break;
 
         case EVP_PKEY_DH:
         case EVP_PKEY_DHX:
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
             dh = EVP_PKEY_get1_DH(evp_pkey);
             if (!dh)
                 goto err;
@@ -891,6 +930,32 @@ EVP_PKEY_set_keys(EVP_PKEY *evp_pkey,
 
             if (!EVP_PKEY_set1_DH(evp_pkey, dh))
                 goto err;
+#else
+
+            if (!(param_bld = OSSL_PARAM_BLD_new())) {
+                goto err;
+            }
+            if (pubkey) {
+                dh_pub_key = BN_bin2bn(pubkey, pubkey_len, NULL);
+                if (!dh_pub_key || !OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_PUB_KEY, dh_pub_key))
+                    goto err;
+            }
+            if (privkey) {
+                dh_priv_key = BN_bin2bn(privkey, privkey_len, NULL);
+                if (!dh_priv_key || !OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_PRIV_KEY, dh_priv_key))
+                    goto err;
+            }
+            if (!(params = OSSL_PARAM_BLD_to_param(param_bld))
+                    || !EVP_PKEY_todata(evp_pkey, EVP_PKEY_KEY_PARAMETERS, &old_params)
+                    || !(new_params = OSSL_PARAM_merge(old_params, params))) {
+                goto err;
+            }
+            if (!(ctx = EVP_PKEY_CTX_new_from_name(NULL, "DH", NULL))
+                || EVP_PKEY_fromdata_init(ctx) <= 0
+                || EVP_PKEY_fromdata(ctx, &new_key, EVP_PKEY_KEYPAIR, new_params) <= 0) {
+                goto err;
+            }
+#endif
             break;
 
         default:
